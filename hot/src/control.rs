@@ -717,6 +717,27 @@ mod tests {
         );
     }
     #[test]
+    fn final_settlement_frees_caps_without_resetting_turnover_or_inflight() {
+        let d = tmp("final_settlement_caps");
+        let (mut c, router) = setup(&d, RiskConfig::default(), &[("a", true)]);
+        c.ledger.record_fill("a", "101", 0, 100.0, 0.50, 0.0);
+        c.tick(&router);
+        let lane = router.lane(0).unwrap();
+        assert_eq!(lane.state.open_usd.load(Ordering::Relaxed), (50.0 * MICRO) as i64);
+        assert_eq!(crate::resolution::book(&mut c.ledger, "a", "101", 1.0), Some(50.0));
+        let mut flight = crate::pending::InFlight::default();
+        flight.by_lane.insert("a".into(), 12.0);
+        flight.by_token.insert(("a".into(), "102".into()), 12.0);
+        c.tick_with(&router, &flight);
+        assert_eq!(lane.state.open_usd.load(Ordering::Relaxed), (12.0 * MICRO) as i64);
+        assert!(!lane.per_token.lock().unwrap().contains_key("101"));
+        assert_eq!(lane.per_token.lock().unwrap()["102"], (12.0 * MICRO) as i64);
+        assert_eq!(lane.state.spent_today.load(Ordering::Relaxed), (62.0 * MICRO) as i64);
+        assert_eq!(crate::resolution::book(&mut c.ledger, "a", "101", 1.0), None);
+        assert!(crate::budget::buy_fits_aged(88.0, Some(100.0), 20.0, Some(0)));
+        assert!(!crate::budget::buy_fits_aged(88.0, Some(0.0), 20.0, Some(0)));
+    }
+    #[test]
     fn per_market_reservations_are_rebuilt_from_remaining_ledger_cost() {
         let d = tmp("permarket");
         let (mut c, r) = setup(&d, RiskConfig::default(), &[("a", true)]);

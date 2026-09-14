@@ -36,6 +36,7 @@ pub mod pending;
 pub mod positions;
 pub mod provenance;
 pub mod settlement;
+pub mod resolution;
 pub mod signal_guard;
 pub mod wal;
 pub mod presign;
