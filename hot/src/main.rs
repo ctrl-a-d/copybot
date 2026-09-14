@@ -6720,9 +6720,8 @@ this as a bad read, not a mass cancellation",
             }
         });
     }
-    const SETTLE_CLOCK_SLOP_SECS: i64 = 120;
     if live {
-        let (ctl, rt, em) = (control.clone(), router.clone(), emitter.clone());
+        let (ctl, em, fund) = (control.clone(), emitter.clone(), funder.clone());
         let rpc = std::env::var("FILLWATCH_RPC")
             .unwrap_or_else(|_| "https://polygon.drpc.org".into());
         let ctf = std::env::var("CTF_ADDRESS")
@@ -6730,233 +6729,35 @@ this as a bad read, not a mass cancellation",
         tokio::spawn(async move {
             let http = reqwest::Client::builder()
                 .user_agent("copybot-resolution")
-                .timeout(Duration::from_secs(10))
-                .build()
-                .unwrap_or_default();
+                .timeout(Duration::from_secs(10)).build().unwrap_or_default();
             let mut resolver = copybot_hot::resolution::Resolver::default();
             let mut tick = tokio::time::interval(Duration::from_secs(60));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tick.tick().await;
-                // Automatic redemption may remove every token from /positions.
-                // Start from our ledger and require final on-chain payout evidence.
-                let tokens: Vec<String> = {
-                    let g = ctl.lock().unwrap();
-                    rt.snapshot().iter()
-                        .flat_map(|lane| g.ledger.holdings(&lane.cfg.name).into_keys())
-                        .collect::<std::collections::HashSet<_>>()
-                        .into_iter().collect()
-                };
-                let payout = resolver.payouts(
-                    &http, "https://gamma-api.polymarket.com", &rpc, &ctf, &tokens,
+                let claims = copybot_hot::resolution::claims(&ctl.lock().unwrap().ledger);
+                if claims.is_empty() { continue; }
+                let proofs = resolver.verified_payouts(
+                    &http,"https://gamma-api.polymarket.com","https://data-api.polymarket.com",
+                    &rpc,&ctf,&fund,&claims,
                 ).await;
-                if payout.is_empty() {
-                    continue;
-                }
-                for lane in rt.snapshot().iter() {
-                    let name = lane.cfg.name.clone();
-                    let held = ctl.lock().unwrap().ledger.holdings(&name);
-                    for tok in held.keys() {
-                        let Some(&pay) = payout.get(tok) else { continue };
-                        let mut g = ctl.lock().unwrap();
-                        let Some(delta) = copybot_hot::resolution::book(
-                            &mut g.ledger, &name, tok, pay,
-                        ) else { continue };
-                        drop(g);
-                        eprintln!(
-                            "[settle] {name}: token …{} resolved at {pay:.3} \
-                                   -> realised {:+.2}",
-                            & tok[tok.len().saturating_sub(8)..], delta
-                        );
-                        em.emit(
-                            serde_json::json!(
-                                { "t" : now_ms(), "ev" : "settle", "lane" : name, "tok" : &
-                                tok[..tok.len().min(14)], "payout" : pay, "realised_delta" :
-                                (delta * 100.0).round() / 100.0 }
-                            ),
-                        );
-                    }
-                }
-            }
-        });
-    }
-    if live {
-        let (ctl, rt, em, fund) = (
-            control.clone(),
-            router.clone(),
-            emitter.clone(),
-            funder.clone(),
-        );
-        tokio::spawn(async move {
-            let http = reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap_or_default();
-            let mut market_tokens: std::collections::HashMap<String, Vec<String>> = Default::default();
-            let mut tick = tokio::time::interval(Duration::from_secs(60));
-            loop {
-                tick.tick().await;
-                let ledger_path = ctl.lock().unwrap().ledger.path.clone();
-                let (corrected, releases) = copybot_hot::ledger::scan_for_settlement(
-                    &ledger_path,
-                );
-                const PAGE: usize = 200;
-                const MAX_PAGES: usize = 25;
-                let mut redemptions = Vec::new();
-                for page in 0..MAX_PAGES {
-                    let url = format!(
-                        "https://data-api.polymarket.com/activity?user={fund}\
-&limit={PAGE}&offset={}&type=REDEEM",
-                        page * PAGE
+                for claim in &claims {
+                    let Some(proof) = proofs.get(&claim.token) else {
+                        em.emit(serde_json::json!({"t":now_ms(),"ev":"settlement_pending",
+                            "tok":claim.token,"released_shares":claim.released,
+                            "why":"awaiting final payout and sufficient custody/redemption evidence"}));
+                        continue;
+                    };
+                    let result = copybot_hot::resolution::book_verified_pool(
+                        &mut ctl.lock().unwrap().ledger,&claim.token,proof,
                     );
-                    let body: serde_json::Value = match http.get(&url).send().await {
-                        Ok(r) if r.status().is_success() => {
-                            r.json().await.unwrap_or_default()
-                        }
-                        _ => break,
-                    };
-                    let rows = copybot_hot::settlement::parse_redemptions(&body);
-                    let short = rows.len() < PAGE;
-                    let fresh = rows.iter().any(|r| !corrected.contains(&r.key()));
-                    redemptions.extend(rows);
-                    if short || !fresh {
-                        break;
-                    }
-                    if page + 1 == MAX_PAGES {
-                        eprintln!(
-                            "[settle] stopped at {MAX_PAGES} pages with unbooked \
-redemptions still older — the next tick continues from the top"
-                        );
-                    }
-                }
-                if redemptions.is_empty() {
-                    continue;
-                }
-                let todo = copybot_hot::settlement::unbooked(&redemptions, &corrected);
-                if todo.is_empty() {
-                    continue;
-                }
-                let lane_names: Vec<String> = rt
-                    .snapshot()
-                    .iter()
-                    .map(|l| l.cfg.name.clone())
-                    .collect();
-                for r in todo {
-                    let tokens = if let Some(t) = market_tokens.get(&r.condition_id) {
-                        t.clone()
-                    } else {
-                        let murl = format!(
-                            "https://clob.polymarket.com/markets/{}", r.condition_id
-                        );
-                        let toks: Vec<String> = match http.get(&murl).send().await {
-                            Ok(resp) if resp.status().is_success() => {
-                                resp.json::<serde_json::Value>()
-                                    .await
-                                    .ok()
-                                    .and_then(|m| {
-                                        m["tokens"]
-                                            .as_array()
-                                            .map(|a| {
-                                                a
-                                                    .iter()
-                                                    .map(|t| t["token_id"].as_str().unwrap_or("").to_string())
-                                                    .collect()
-                                            })
-                                    })
-                                    .unwrap_or_default()
-                            }
-                            _ => Vec::new(),
-                        };
-                        if !toks.is_empty() {
-                            market_tokens.insert(r.condition_id.clone(), toks.clone());
-                        }
-                        toks
-                    };
-                    let Some(tok) = tokens
-                        .get(r.outcome_index as usize)
-                        .filter(|t| !t.is_empty()) else { continue };
-                    let payout_per_share = r.usdc / r.size;
-                    let mut booked: Option<(String, f64)> = None;
-                    for name in &lane_names {
-                        let key = r.lane_key(name);
-                        if corrected.contains(&key) {
-                            continue;
-                        }
-                        let xkey = copybot_hot::settlement::cross_writer_key(name, tok);
-                        if corrected.contains(&xkey) {
-                            eprintln!(
-                                "[settle] {name}: skipping token …{} — already \
-                                       booked by settlewatch ({xkey})",
-                                & tok[tok.len().saturating_sub(8)..]
-                            );
-                            em.emit(
-                                serde_json::json!(
-                                    { "t" : now_ms(), "ev" : "settle_dedupe_crosswriter", "lane"
-                                    : name, "tok" : & tok[..tok.len().min(14)], "key" : key,
-                                    "alt_key" : xkey, "tx" : & r.tx, "note" :
-                                    "settlewatch already credited this settlement; \
-                                         if this token really redeemed twice, this is the \
-                                         payout that went unbooked"
-                                    }
-                                ),
-                            );
-                            continue;
-                        }
-                        let Some(&(released, avg_cost, rel_t)) = releases
-                            .get(&(name.clone(), tok.to_string())) else { continue };
-                        if rel_t < r.ts - SETTLE_CLOCK_SLOP_SECS {
-                            continue;
-                        }
-                        let shares = released.min(r.size);
-                        if shares <= 1e-9 {
-                            continue;
-                        }
-                        booked = Some((name.clone(), shares));
-                        let proceeds = shares * payout_per_share;
-                        let mut g = ctl.lock().unwrap();
-                        g.ledger
-                            .record_realised_adjustment_tx(
-                                name,
-                                tok,
-                                shares,
-                                proceeds,
-                                avg_cost,
-                                "redemption observed after an earlier P&L-neutral \
-                             reconciliation release; corrected to the real on-chain payout",
-                                &key,
-                            );
-                        drop(g);
-                        eprintln!(
-                            "[settle] {name}: CORRECTED a prior neutral release for \
-                                   token …{} — real payout ${payout_per_share:.4}/sh \
-                                   (${proceeds:.2} total)",
-                            & tok[tok.len().saturating_sub(8)..]
-                        );
-                        em.emit(
-                            serde_json::json!(
-                                { "t" : now_ms(), "ev" : "settle_correction", "lane" : name,
-                                "tok" : & tok[..tok.len().min(14)], "payout" :
-                                payout_per_share, "shares" : shares, "key" : key, "proceeds"
-                                : (proceeds * 100.0).round() / 100.0 }
-                            ),
-                        );
-                        break;
-                    }
-                    if let Some((lane, shares)) = booked {
-                        if shares + 1e-9 < r.size {
-                            eprintln!(
-                                "[settle] {lane} claimed {shares:.4} of a \
-{:.4}-share redemption on …{} — the remainder belongs to no lane",
-                                r.size, & tok[tok.len().saturating_sub(8)..]
-                            );
-                            em.emit(
-                                serde_json::json!(
-                                    { "t" : now_ms(), "ev" : "settle_unclaimed_remainder",
-                                    "lane" : lane, "tok" : & tok[..tok.len().min(14)], "claimed"
-                                    : shares, "redeemed" : r.size }
-                                ),
-                            );
-                        }
+                    match result {
+                        Ok(rows) => for (lane,delta) in rows {
+                            em.emit(serde_json::json!({"t":now_ms(),"ev":"settle","lane":lane,
+                                "tok":claim.token,"payout":proof.payout,"realised_delta":delta}));
+                        },
+                        Err(why) => em.emit(serde_json::json!({"t":now_ms(),"ev":"settlement_pending",
+                            "tok":claim.token,"why":why})),
                     }
                 }
             }
@@ -7074,19 +6875,19 @@ redemptions still older — the next tick continues from the top"
                         );
                     }
                     drift_w.lock().unwrap().insert(name.clone(), total_drift);
-                    let phantoms: Vec<(String, f64, f64)> = ctl
-                        .lock()
-                        .unwrap()
-                        .ledger
-                        .releasable(&name, &chain, RECON_RELEASE_QUIET_SECS, now)
-                        .into_iter()
-                        .filter(|(t, _, _)| !inflight.contains(t))
-                        .collect();
+                    // Prepare and persist under one lock. Settlement cannot
+                    // interleave and turn a stale release into a second credit.
+                    let phantoms = {
+                        let mut g = ctl.lock().unwrap();
+                        let releases: Vec<_> = g.ledger
+                            .releasable(&name, &chain, RECON_RELEASE_QUIET_SECS, now)
+                            .into_iter().filter(|(t, _, _)| !inflight.contains(t)).collect();
+                        for (tok, gone, px) in &releases {
+                            g.ledger.record_recon_fill(&name,tok,1,*gone,*px,0.0);
+                        }
+                        releases
+                    };
                     for (tok, gone, px) in phantoms {
-                        ctl.lock()
-                            .unwrap()
-                            .ledger
-                            .record_recon_fill(&name, &tok, 1, gone, px, 0.0);
                         eprintln!(
                             "[recon] {name}: released phantom …{} ({gone:.4} sh) — \
 the chain has not shown it for {RECON_RELEASE_QUIET_SECS}s",

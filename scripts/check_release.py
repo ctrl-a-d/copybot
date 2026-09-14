@@ -27,6 +27,14 @@ PUBLIC = {
     'c3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62',
     'd543adfd945773f1a62f74f0ee55a5e3b9b1a28262980ba90b1a8dcf9c1b0b0b',
     '4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb',
+    # Public redemption contracts and their event signatures.
+    'ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef',
+    '2682012a4a4f1973119f1c9b90745d1bd91fa2bab387344f044cb3586864d18d',
+    '9140a6a270ef945260c03894b3c6b3b2695e9d5101feef0ff24fec960cfd3224',
+    '74a51ebefec30281ec6849b727ec7916f9b1a3e5e148d6771d98315215b38b96',
+    'd91e80cf2e7be2e162c6513ced06f1dd0da35296',
+    'a1200000d0002264c9a1698e001292d00e1b00af',
+    '3a3bd7bb9528e159577f7c2e685cc81a765002e2',
 }
 # Verified upstream CI action revisions and scanner release checksum.
 PUBLIC_BUILD_DIGESTS = {

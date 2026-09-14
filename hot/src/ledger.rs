@@ -64,6 +64,12 @@ pub struct LaneBook {
     pub name: String,
     pub risk: LaneRisk,
     pub positions: HashMap<String, Position>,
+    // Reconciliation can remove custody without identifying its proceeds.
+    // Retain that basis until settlement evidence accounts for the release.
+    pending_releases: HashMap<String, (f64, f64)>,
+    release_windows: HashMap<String, (i64, i64)>,
+    settled_shares: HashMap<String, f64>,
+    first_buys: HashMap<String, i64>,
     pub spent_today: f64,
     pub spent_day: i64,
     pub fired: u64,
@@ -76,6 +82,10 @@ impl LaneBook {
             name: name.to_string(),
             risk: LaneRisk::new(name, cfg),
             positions: HashMap::new(),
+            pending_releases: HashMap::new(),
+            release_windows: HashMap::new(),
+            settled_shares: HashMap::new(),
+            first_buys: HashMap::new(),
             spent_today: 0.0,
             spent_day: utc_day(now_secs()),
             fired: 0,
@@ -256,11 +266,52 @@ impl Ledger {
         price: f64,
         fee: f64,
     ) {
+        let (shares, price) = if side == 1 {
+            let Some(pos) = self.lanes.get(lane).and_then(|b| b.positions.get(token)) else {
+                return;
+            };
+            if !shares.is_finite() || shares <= 1e-9 || pos.shares <= 1e-9 {
+                return;
+            }
+            (shares.min(pos.shares), pos.avg_cost())
+        } else {
+            (shares, price)
+        };
         let row = serde_json::json!(
             { "ev" : "fill", "lane" : lane, "token" : token, "side" : side, "shares" :
             shares, "price" : price, "fee" : fee, "recon" : true, "t" : now_secs() }
         );
         self.apply(&row, true);
+    }
+    pub fn pending_release(&self, lane: &str, token: &str) -> Option<(f64, f64)> {
+        self.lanes.get(lane)?.pending_releases.get(token).copied()
+            .filter(|(shares, _)| *shares > 1e-9)
+    }
+    // Bounds span the accumulated releases, including a partially accounted
+    // batch. They are not evidence that any particular share was redeemed.
+    pub fn pending_release_window(&self, lane: &str, token: &str) -> Option<(i64, i64)> {
+        self.pending_release(lane, token)?;
+        self.lanes.get(lane)?.release_windows.get(token).copied()
+    }
+    pub fn settlement_tokens(&self, lane: &str) -> Vec<String> {
+        let Some(book) = self.lanes.get(lane) else { return Vec::new(); };
+        let mut tokens: Vec<String> = book.positions.iter()
+            .filter(|(_, p)| p.shares > 1e-9)
+            .map(|(token, _)| token.clone())
+            .chain(book.pending_releases.iter()
+                .filter(|(_, (shares, _))| *shares > 1e-9)
+                .map(|(token, _)| token.clone()))
+            .collect();
+        tokens.sort();
+        tokens.dedup();
+        tokens
+    }
+    pub fn pool_settled_shares(&self, token: &str) -> f64 {
+        self.lanes.values().filter_map(|b| b.settled_shares.get(token)).sum()
+    }
+    pub fn first_tracked_buy(&self, token: &str) -> Option<i64> {
+        self.lanes.values().filter_map(|b| b.first_buys.get(token)).copied()
+            .min().filter(|t| *t > 0)
     }
     pub fn realised_reset(&mut self, lane: &str, why: &str) {
         let row = serde_json::json!(
@@ -421,7 +472,7 @@ impl Ledger {
                 let fee = row["fee"].as_f64().unwrap_or(0.0);
                 let side = row["side"].as_u64().unwrap_or(0) as u8;
                 let tok_tail = token[token.len().saturating_sub(8)..].to_string();
-                let pos = lane.positions.entry(token).or_default();
+                let pos = lane.positions.entry(token.clone()).or_default();
                 let was_flat = pos.shares <= 1e-9;
                 pos.last_fill_t = pos.last_fill_t.max(row["t"].as_i64().unwrap_or(0));
                 if side == 0 {
@@ -438,6 +489,10 @@ impl Ledger {
                     lane.roll_day(now);
                     let row_t = row["t"].as_i64().unwrap_or(0);
                     let is_recon = row["recon"].as_bool().unwrap_or(false);
+                    if shares > 1e-9 {
+                        lane.first_buys.entry(token.clone())
+                            .and_modify(|t| *t = (*t).min(row_t)).or_insert(row_t);
+                    }
                     if !is_recon && row_t > 0 && utc_day(row_t) == utc_day(now) {
                         lane.spent_today += shares * price + fee;
                     }
@@ -455,6 +510,15 @@ of …{} but only {:.4} tracked — excess IGNORED (replay-safe), investigate th
                     }
                     let avg = pos.avg_cost();
                     let is_recon = row["recon"].as_bool().unwrap_or(false);
+                    if is_recon && sold > 1e-9 {
+                        let release = lane.pending_releases.entry(token.clone()).or_default();
+                        release.0 += sold;
+                        release.1 += sold * avg;
+                        let t = row["t"].as_i64().unwrap_or(0);
+                        lane.release_windows.entry(token.clone())
+                            .and_modify(|window| { window.0 = window.0.min(t); window.1 = window.1.max(t); })
+                            .or_insert((t, t));
+                    }
                     let realised = if is_recon {
                         0.0
                     } else {
@@ -485,11 +549,34 @@ of …{} but only {:.4} tracked — excess IGNORED (replay-safe), investigate th
             }
             "realised_adjust" => {
                 lane.risk.on_adjust(row["pnl"].as_f64().unwrap_or(0.0));
+                let settlement_key = crate::settlement::cross_writer_key(lane_name, &token);
+                if ["key", "alt_key"].iter().any(|field| row[*field].as_str() == Some(&settlement_key)) {
+                    let covered = row["shares"].as_f64().unwrap_or(0.0);
+                    if covered.is_finite() && covered > 1e-9 {
+                        *lane.settled_shares.entry(token.clone()).or_default() += covered;
+                        if let Some(release) = lane.pending_releases.get_mut(&token) {
+                            let consumed = covered.min(release.0);
+                            let avg = row["avg_cost"].as_f64().unwrap_or(0.0);
+                            let covered_cost = if avg.is_finite() && avg >= 0.0 {
+                                (consumed * avg).min(release.1)
+                            } else {
+                                0.0
+                            };
+                            release.0 = (release.0 - consumed).max(0.0);
+                            release.1 = (release.1 - covered_cost).max(0.0);
+                            if release.0 <= 1e-9 {
+                                lane.pending_releases.remove(&token);
+                                lane.release_windows.remove(&token);
+                            }
+                        }
+                    }
+                }
             }
             "settle" => {
                 let payout = row["payout"].as_f64().unwrap_or(0.0);
                 if let Some(pos) = lane.positions.get_mut(&token) {
                     if pos.shares > 1e-9 {
+                        *lane.settled_shares.entry(token.clone()).or_default() += pos.shares;
                         let realised = pos.shares * payout - pos.cost;
                         lane.risk.on_close(realised);
                         lane.risk.on_flat();
@@ -963,6 +1050,165 @@ fn prefix_digest(raw: &str, lines: u64) -> (String, u64) {
     (hex::encode(h.finalize()), n)
 }
 pub const LEDGER_GROWTH_ALARM_LINES: u64 = 250_000;
+
+#[cfg(test)]
+mod release_accounting_tests {
+    use super::*;
+
+    fn ledger() -> Ledger {
+        Ledger::new("", &[("a".into(), RiskConfig::default()), ("b".into(), RiskConfig::default())])
+    }
+    fn fill(l: &mut Ledger, lane: &str, side: u8, shares: f64, price: f64, recon: bool, t: i64) {
+        assert!(l.apply(&serde_json::json!({"ev":"fill","lane":lane,"token":"101",
+            "side":side,"shares":shares,"price":price,"recon":recon,"t":t}), false));
+    }
+    fn near(a: f64, b: f64) {
+        assert!((a - b).abs() < 1e-9, "{a} != {b}");
+    }
+
+    #[test]
+    fn stale_release_rows_retain_only_effective_shares_and_actual_basis() {
+        let mut l = ledger();
+        fill(&mut l, "a", 0, 10.0, 0.4, false, 100);
+        fill(&mut l, "a", 1, 6.0, 0.6, false, 101);
+        fill(&mut l, "a", 1, 20.0, 0.9, true, 102);
+        fill(&mut l, "a", 1, 20.0, 0.9, true, 103);
+        let (shares, cost) = l.pending_release("a", "101").unwrap();
+        near(shares, 4.0);
+        near(cost, 1.6);
+        assert_eq!(l.pending_release_window("a", "101"), Some((102, 102)));
+        near(l.lanes["a"].risk.realised_pnl, 1.2);
+        near(l.open_usd("a"), 0.0);
+        assert_eq!(l.settlement_tokens("a"), ["101"]);
+    }
+
+    #[test]
+    fn release_remains_uncredited_when_final_payout_is_known() {
+        let mut l = ledger();
+        fill(&mut l, "a", 0, 10.0, 0.4, false, 100);
+        l.record_recon_fill("a", "101", 1, 4.0, 0.9, 0.0);
+        l.record_settlement("a", "101", 1.0);
+        near(l.lanes["a"].risk.realised_pnl, 3.6);
+        near(l.pool_settled_shares("101"), 6.0);
+        assert_eq!(l.pending_release("a", "101"), Some((4.0, 1.6)));
+        l.record_settlement("a", "101", 1.0);
+        near(l.pool_settled_shares("101"), 6.0);
+        assert_eq!(l.settlement_tokens("a"), ["101"]);
+    }
+
+    #[test]
+    fn historical_adjustments_consume_only_covered_release_and_preserve_pnl() {
+        let mut l = ledger();
+        fill(&mut l, "a", 0, 10.0, 0.4, false, 100);
+        fill(&mut l, "a", 1, 10.0, 0.9, true, 101);
+        l.record_realised_adjustment_tx("a", "101", 2.5, 2.5, 0.4, "redemption", "tx1");
+        assert_eq!(l.pending_release("a", "101"), Some((7.5, 3.0)));
+        near(l.pool_settled_shares("101"), 2.5);
+        l.record_realised_adjustment("a", "101", 1.0, 0.8, 0.4, "manual correction");
+        assert_eq!(l.pending_release("a", "101"), Some((7.5, 3.0)));
+        near(l.lanes["a"].risk.realised_pnl, 1.9);
+        // The older writer used key rather than alt_key. Existing journal PnL
+        // remains authoritative even when its requested quantity was excessive.
+        assert!(l.apply(&serde_json::json!({"ev":"realised_adjust","lane":"a","token":"101",
+            "shares":20.0,"avg_cost":0.4,"pnl":12.0,"key":"settle:a:101"}), false));
+        assert_eq!(l.pending_release("a", "101"), None);
+        assert_eq!(l.pending_release_window("a", "101"), None);
+        near(l.pool_settled_shares("101"), 22.5);
+        near(l.lanes["a"].risk.realised_pnl, 13.9);
+    }
+
+    #[test]
+    fn release_basis_accumulates_across_distinct_inventory_cycles() {
+        let mut l = ledger();
+        fill(&mut l, "a", 0, 4.0, 0.2, false, 100);
+        fill(&mut l, "a", 1, 4.0, 0.2, true, 101);
+        fill(&mut l, "a", 0, 6.0, 0.7, false, 102);
+        fill(&mut l, "a", 1, 6.0, 0.7, true, 103);
+        let (shares, cost) = l.pending_release("a", "101").unwrap();
+        near(shares, 10.0);
+        near(cost, 5.0);
+        assert_eq!(l.pending_release_window("a", "101"), Some((101, 103)));
+        l.record_realised_adjustment_tx("a", "101", 4.0, 4.0, 0.2, "redemption", "tx1");
+        let (shares, cost) = l.pending_release("a", "101").unwrap();
+        near(shares, 6.0);
+        near(cost, 4.2);
+        assert_eq!(l.pending_release_window("a", "101"), Some((101, 103)));
+    }
+
+    #[test]
+    fn replay_restores_releases_and_pool_evidence_counters_without_pnl_changes() {
+        let dir = std::env::temp_dir().join(format!("copybot-release-replay-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ledger.jsonl");
+        let rows = [
+            serde_json::json!({"ev":"fill","lane":"a","token":"101","side":0,"shares":10.0,"price":0.4,"t":100}),
+            serde_json::json!({"ev":"fill","lane":"a","token":"101","side":1,"shares":10.0,"price":0.9,"recon":true,"t":101}),
+            serde_json::json!({"ev":"realised_adjust","lane":"a","token":"101","shares":3.0,"avg_cost":0.4,"pnl":1.8,"alt_key":"settle:a:101","key":"tx1","t":102}),
+            serde_json::json!({"ev":"fill","lane":"b","token":"101","side":0,"shares":2.0,"price":0.5,"recon":true,"t":90}),
+            serde_json::json!({"ev":"settle","lane":"b","token":"101","payout":0.0,"t":103}),
+        ];
+        std::fs::write(&path, rows.iter().map(|r| format!("{r}\n")).collect::<String>()).unwrap();
+        let cfgs = [("a".into(), RiskConfig::default()), ("b".into(), RiskConfig::default())];
+        let replayed = Ledger::new(path.to_str().unwrap(), &cfgs);
+        let mut live = ledger();
+        for row in &rows { assert!(live.apply(row, false)); }
+        assert_eq!(replayed.pending_release("a", "101"), live.pending_release("a", "101"));
+        assert_eq!(replayed.pending_release_window("a", "101"), Some((101, 101)));
+        near(replayed.pending_release("a", "101").unwrap().1, 2.8);
+        near(replayed.pool_settled_shares("101"), 5.0);
+        assert_eq!(replayed.first_tracked_buy("101"), Some(90));
+        near(replayed.lanes["a"].risk.realised_pnl, 1.8);
+        near(replayed.lanes["b"].risk.realised_pnl, -1.0);
+        let mut later_lane = Ledger::new(path.to_str().unwrap(), &cfgs[..1]);
+        later_lane.ensure_lane("b", RiskConfig::default());
+        near(later_lane.pool_settled_shares("101"), 5.0);
+        assert_eq!(later_lane.first_tracked_buy("101"), Some(90));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn new_reconciliation_rows_clamp_quantity_and_snapshot_current_cost() {
+        let dir = std::env::temp_dir().join(format!("copybot-release-clamp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ledger.jsonl");
+        let mut l = Ledger::new(path.to_str().unwrap(), &[("a".into(), RiskConfig::default())]);
+        l.record_fill("a", "101", 0, 4.0, 0.4, 0.0);
+        l.record_recon_fill("a", "101", 1, 20.0, 0.9, 0.0);
+        let before = std::fs::read_to_string(&path).unwrap();
+        l.record_recon_fill("a", "101", 1, 20.0, 0.9, 0.0);
+        l.record_recon_fill("a", "102", 1, 20.0, 0.9, 0.0);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        let row: serde_json::Value = serde_json::from_str(before.lines().last().unwrap()).unwrap();
+        assert_eq!(row["shares"], 4.0);
+        assert_eq!(row["price"], 0.4);
+        assert_eq!(l.pending_release("a", "101"), Some((4.0, 1.6)));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_release_append_does_not_move_inventory_or_pending_basis() {
+        let mut l = ledger();
+        fill(&mut l, "a", 0, 10.0, 0.4, false, 100);
+        let path = std::env::temp_dir().join(format!("copybot-release-unwritable-{}", std::process::id()));
+        std::fs::write(&path, b"regular file").unwrap();
+        l.path = path.join("ledger.jsonl").to_str().unwrap().into();
+        l.record_recon_fill("a", "101", 1, 10.0, 0.4, 0.0);
+        near(l.lanes["a"].positions["101"].shares, 10.0);
+        assert_eq!(l.pending_release("a", "101"), None);
+        assert!(!l.persistence_ok());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn missing_old_buy_timestamp_does_not_allow_a_later_evidence_cutoff() {
+        let mut l = ledger();
+        fill(&mut l, "a", 0, 1.0, 0.4, true, 0);
+        fill(&mut l, "b", 0, 1.0, 0.4, false, 100);
+        assert_eq!(l.first_tracked_buy("101"), None);
+        assert_eq!(l.first_tracked_buy("unknown"), None);
+    }
+}
+
 impl Ledger {
     pub fn continuity(&self) -> Option<Continuity> {
         let raw = std::fs::read_to_string(&self.path).ok()?;

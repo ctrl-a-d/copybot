@@ -9,6 +9,7 @@ use std::collections::HashMap;
 struct Outcome {
     condition: [u8; 32],
     index: usize,
+    tokens: [String; 2],
 }
 
 fn market_outcome(body: &Value, token: &str) -> Option<Outcome> {
@@ -33,6 +34,7 @@ fn market_outcome(body: &Value, token: &str) -> Option<Outcome> {
     Some(Outcome {
         condition,
         index: tokens.iter().position(|t| t == token)?,
+        tokens: tokens.try_into().ok()?,
     })
 }
 
@@ -95,7 +97,394 @@ pub struct Resolver {
     // Only immutable metadata is cached. Unresolved or failed reads are retried.
     outcomes: HashMap<String, Outcome>,
 }
+
+#[derive(Clone, Debug)]
+pub struct Claim {
+    pub token: String,
+    pub held: f64,
+    pub released: f64,
+    pub settled: f64,
+    pub first_buy: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct Proof {
+    pub payout: f64,
+    pub balance_units: u128,
+    pub redeemed_units: u128,
+}
+
+pub fn claims(ledger: &crate::ledger::Ledger) -> Vec<Claim> {
+    let tokens: std::collections::HashSet<_> = ledger
+        .lanes
+        .keys()
+        .flat_map(|lane| ledger.settlement_tokens(lane))
+        .collect();
+    tokens
+        .into_iter()
+        .filter_map(|token| {
+            Some(Claim {
+                held: ledger.pool_claim(&token),
+                released: ledger
+                    .lanes
+                    .keys()
+                    .filter_map(|lane| ledger.pending_release(lane, &token))
+                    .map(|p| p.0)
+                    .sum(),
+                settled: ledger.pool_settled_shares(&token),
+                first_buy: ledger.first_tracked_buy(&token).unwrap_or(0),
+                token,
+            })
+        })
+        .collect()
+}
+
+/// The caller holds the control mutex throughout this operation. A proof is
+/// checked against the current whole-wallet lane pool, not an earlier snapshot.
+pub fn book_verified_pool(
+    ledger: &mut crate::ledger::Ledger,
+    token: &str,
+    proof: &Proof,
+) -> Result<Vec<(String, f64)>, &'static str> {
+    if !ledger.persistence_ok() {
+        return Err("ledger persistence unavailable");
+    }
+    let held = ledger.pool_claim(token);
+    let released: f64 = ledger
+        .lanes
+        .keys()
+        .filter_map(|lane| ledger.pending_release(lane, token))
+        .map(|p| p.0)
+        .sum();
+    if !proof.covers(held, released, ledger.pool_settled_shares(token)) {
+        return Err("custody/redemption evidence does not cover the current lane pool");
+    }
+    let mut booked = Vec::new();
+    let mut lanes: Vec<_> = ledger.lanes.keys().cloned().collect();
+    lanes.sort();
+    for lane in lanes {
+        let mut delta = 0.0;
+        let mut changed = false;
+        if let Some((shares, cost)) = ledger.pending_release(&lane, token) {
+            let already =
+                share_units(ledger.pool_settled_shares(token)).ok_or("invalid settled units")?;
+            ledger.record_realised_adjustment_tx(
+                &lane,
+                token,
+                shares,
+                shares * proof.payout,
+                cost / shares,
+                "verified redemption of previously reconciled shares",
+                &format!("resolution:{lane}:{token}:{already}"),
+            );
+            if !ledger.persistence_ok() {
+                return Err("settlement credit could not be persisted");
+            }
+            delta += shares * proof.payout - cost;
+            changed = true;
+        }
+        if let Some(realised) = book(ledger, &lane, token, proof.payout) {
+            delta += realised;
+            changed = true;
+        }
+        if !ledger.persistence_ok() {
+            return Err("settlement could not be persisted");
+        }
+        if changed {
+            booked.push((lane, delta));
+        }
+    }
+    Ok(booked)
+}
+
+fn share_units(shares: f64) -> Option<u128> {
+    let units = shares * 1_000_000.0;
+    if !units.is_finite()
+        || units < 0.0
+        || units > u64::MAX as f64
+        || (units - units.round()).abs() > 0.01
+    {
+        return None;
+    }
+    Some(units.round() as u128)
+}
+
+impl Proof {
+    pub fn covers(&self, held: f64, released: f64, settled: f64) -> bool {
+        let (Some(h), Some(r), Some(s)) = (
+            share_units(held),
+            share_units(released),
+            share_units(settled),
+        ) else {
+            return false;
+        };
+        // Require conservation across the entire lane pool, including earlier
+        // durable credits. Surplus or missing evidence is unattributed inventory.
+        self.balance_units.checked_add(self.redeemed_units)
+            == h.checked_add(r).and_then(|n| n.checked_add(s))
+            && self.redeemed_units >= r
+            && self.payout.is_finite()
+            && (0.0..=1.0).contains(&self.payout)
+    }
+}
+
+async fn rpc_json(http: &reqwest::Client, rpc: &str, method: &str, params: Value) -> Option<Value> {
+    let body: Value = http
+        .post(rpc)
+        .json(&json!({"jsonrpc":"2.0", "id":1, "method":method, "params":params}))
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    if body.get("error").is_some() {
+        return None;
+    }
+    body.get("result").filter(|v| !v.is_null()).cloned()
+}
+
+fn quantity(v: &Value) -> Option<u64> {
+    u64::from_str_radix(v.as_str()?.strip_prefix("0x")?, 16).ok()
+}
+
+async fn word_at(
+    http: &reqwest::Client,
+    rpc: &str,
+    ctf: &str,
+    block: &str,
+    data: String,
+) -> Option<u128> {
+    let value = rpc_json(http, rpc, "eth_call", json!([{"to":ctf,"data":data},block])).await?;
+    rpc_word(&json!({"result":value}))
+}
+
+fn token_word(token: &str) -> Option<String> {
+    let mut word = [0u8; 32];
+    if token.is_empty() {
+        return None;
+    }
+    for digit in token.bytes() {
+        if !digit.is_ascii_digit() {
+            return None;
+        }
+        let mut carry = (digit - b'0') as u16;
+        for byte in word.iter_mut().rev() {
+            let value = *byte as u16 * 10 + carry;
+            *byte = value as u8;
+            carry = value >> 8;
+        }
+        if carry != 0 {
+            return None;
+        }
+    }
+    Some(hex::encode(word))
+}
+
+fn address(raw: &str) -> Option<[u8; 20]> {
+    hex::decode(raw.strip_prefix("0x")?).ok()?.try_into().ok()
+}
+
 impl Resolver {
+    /// No keys or transaction submission. All balances and payout vectors are
+    /// read at one finalized block, preventing pre-burn balance double counting.
+    pub async fn verified_payouts(
+        &mut self,
+        http: &reqwest::Client,
+        gamma: &str,
+        data_api: &str,
+        rpc: &str,
+        ctf: &str,
+        funder: &str,
+        claims: &[Claim],
+    ) -> HashMap<String, Proof> {
+        let mut verified = HashMap::new();
+        let (Some(funder_bytes), Some(ctf_bytes)) = (address(funder), address(ctf)) else {
+            return verified;
+        };
+        let Some(head) = rpc_json(
+            http,
+            rpc,
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+        )
+        .await
+        else {
+            return verified;
+        };
+        let (Some(number), Some(block), Some(until)) = (
+            quantity(&head["number"]), head["number"].as_str(),
+            quantity(&head["timestamp"]).and_then(|t| i64::try_from(t).ok()),
+        )
+        else {
+            return verified;
+        };
+        if number == 0 || until <= 0 || !head["hash"].as_str().is_some_and(|hash| {
+            valid_hash(hash) && hash[2..].bytes().any(|b| b != b'0')
+        }) {
+            return verified;
+        }
+        let tokens: Vec<_> = claims.iter().map(|c| c.token.clone()).collect();
+        // Metadata is cached by the existing resolver; price quotes are never
+        // used as payout evidence. The vector is checked again at finalized head.
+        self.payouts(http, gamma, rpc, ctf, &tokens).await;
+        let mut transactions: Option<Option<Vec<RedemptionTransaction>>> = None;
+        let mut receipts: HashMap<String, Option<Value>> = HashMap::new();
+        let mut blocks: HashMap<u64, Option<Value>> = HashMap::new();
+        blocks.insert(number, Some(head.clone()));
+        for claim in claims {
+            if claim.first_buy <= 0 || claim.first_buy > until { continue; }
+            let Some(outcome) = self.outcomes.get(&claim.token) else {
+                continue;
+            };
+            let condition = hex::encode(outcome.condition);
+            let Some(denominator) =
+                word_at(http, rpc, ctf, block, format!("0xdd34de67{condition}")).await
+            else {
+                continue;
+            };
+            if denominator == 0 {
+                continue;
+            }
+            let mut numerators = [0; 2];
+            let mut vector_ok = true;
+            for (index, numerator) in numerators.iter_mut().enumerate() {
+                match word_at(
+                    http,
+                    rpc,
+                    ctf,
+                    block,
+                    format!("0x0504c814{condition}{index:064x}"),
+                )
+                .await
+                {
+                    Some(n) if n <= denominator => *numerator = n,
+                    _ => {
+                        vector_ok = false;
+                        break;
+                    }
+                }
+            }
+            if !vector_ok || numerators[0].checked_add(numerators[1]) != Some(denominator) {
+                continue;
+            }
+            let mut tokens_bound = true;
+            for (index, token) in outcome.tokens.iter().enumerate() {
+                if !crate::token_binding::verifies(http, rpc, ctf, block, outcome.condition, index, token).await {
+                    tokens_bound = false;
+                    break;
+                }
+            }
+            if !tokens_bound { continue; }
+            let Some(token) = token_word(&claim.token) else {
+                continue;
+            };
+            let Some(balance) = word_at(
+                http,
+                rpc,
+                ctf,
+                block,
+                format!(
+                    "0x00fdd58e{}{}",
+                    hex::encode(crate::merge::word_addr(&funder_bytes)),
+                    token
+                ),
+            )
+            .await
+            else {
+                continue;
+            };
+            let mut proof = Proof {
+                payout: numerators[outcome.index] as f64 / denominator as f64,
+                balance_units: balance,
+                redeemed_units: 0,
+            };
+            if proof.covers(claim.held, claim.released, claim.settled) {
+                verified.insert(claim.token.clone(), proof);
+                continue;
+            }
+            if transactions.is_none() {
+                let since = claims.iter().map(|c| c.first_buy).filter(|t| *t > 0).min().unwrap_or(0);
+                transactions = Some(redemption_transactions(http, data_api, funder, since, until).await);
+            }
+            let Some(Some(transactions)) = transactions.as_ref() else { continue; };
+            let context_base = crate::redemption::RedemptionContext {
+                expected_tx: String::new(),
+                funder: funder_bytes,
+                ctf: ctf_bytes,
+                condition: outcome.condition,
+                tokens: outcome.tokens.clone(),
+                numerators,
+                denominator,
+            };
+            let mut seen = std::collections::HashSet::new();
+            let mut complete = true;
+            for transaction in transactions.iter().filter(|t| t.condition == outcome.condition) {
+                let tx = &transaction.tx;
+                if !receipts.contains_key(tx) {
+                    let receipt = rpc_json(http, rpc, "eth_getTransactionReceipt", json!([tx])).await;
+                    receipts.insert(tx.clone(), receipt);
+                }
+                let Some(Some(receipt)) = receipts.get(tx) else {
+                    complete = false;
+                    break;
+                };
+                let mut context = context_base.clone();
+                context.expected_tx = tx.clone();
+                let Ok(evidence) = crate::redemption::verify_receipt(receipt, &context) else {
+                    complete = false;
+                    break;
+                };
+                if evidence.block_number > number {
+                    continue;
+                }
+                if !blocks.contains_key(&evidence.block_number) {
+                    let header = rpc_json(
+                        http,
+                        rpc,
+                        "eth_getBlockByNumber",
+                        json!([format!("0x{:x}", evidence.block_number), false]),
+                    )
+                    .await;
+                    blocks.insert(evidence.block_number, header);
+                }
+                let Some(Some(header)) = blocks.get(&evidence.block_number) else {
+                    complete = false;
+                    break;
+                };
+                let timestamp = quantity(&header["timestamp"]).and_then(|t| i64::try_from(t).ok());
+                if header["hash"].as_str() != Some(evidence.block_hash.as_str())
+                    || quantity(&header["number"]) != Some(evidence.block_number)
+                    || !timestamp.is_some_and(|t| t > 0 && t <= until)
+                {
+                    complete = false;
+                    break;
+                }
+                if timestamp.is_some_and(|t| t < claim.first_buy) {
+                    continue;
+                }
+                for redeemed in &evidence.tokens {
+                    if redeemed.token == claim.token
+                        && seen.insert((evidence.tx.clone(), redeemed.token.clone()))
+                    {
+                        let Some(total) = proof.redeemed_units.checked_add(redeemed.units) else {
+                            complete = false;
+                            break;
+                        };
+                        proof.redeemed_units = total;
+                    }
+                }
+                if !complete { break; }
+            }
+            if complete && proof.covers(claim.held, claim.released, claim.settled) {
+                verified.insert(claim.token.clone(), proof);
+            }
+        }
+        verified
+    }
+
     pub async fn payouts(
         &mut self,
         http: &reqwest::Client,
@@ -156,6 +545,170 @@ impl Resolver {
             }
         }
         payouts
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RedemptionTransaction {
+    tx: String,
+    condition: [u8; 32],
+}
+
+fn valid_hash(value: &str) -> bool {
+    value.len() == 66 && value.starts_with("0x") && hex::decode(&value[2..]).is_ok()
+}
+
+fn redemption_page(body: &Value, since: i64, until: i64) -> Option<(Vec<RedemptionTransaction>, bool)> {
+    let rows = body.as_array()?;
+    if rows.len() > 200 { return None; }
+    let mut transactions = Vec::new();
+    for row in rows {
+        if row["type"].as_str()? != "REDEEM" { return None; }
+        let timestamp = row["timestamp"].as_i64()?;
+        if timestamp < since || timestamp > until { return None; }
+        let tx = row["transactionHash"].as_str()?;
+        if !valid_hash(tx) { return None; }
+        let condition = crate::merge::condition_id_bytes(row["conditionId"].as_str()?)?;
+        transactions.push(RedemptionTransaction { tx: tx.to_ascii_lowercase(), condition });
+    }
+    Some((transactions, rows.len() < 200))
+}
+
+async fn redemption_transactions(
+    http: &reqwest::Client,
+    data_api: &str,
+    funder: &str,
+    since: i64,
+    until: i64,
+) -> Option<Vec<RedemptionTransaction>> {
+    if since <= 0 || until < since { return None; }
+    let mut transactions = std::collections::HashMap::new();
+    // Discovery is bounded, but a truncated or failed scan is not a complete
+    // burn total. Never let a convenient subset hide surplus redemption evidence.
+    for page in 0..25 {
+        let body: Value = http.get(format!("{}/activity", data_api.trim_end_matches('/')))
+            .query(&[
+                ("user", funder.to_string()),
+                ("type", "REDEEM".into()),
+                ("limit", "200".into()),
+                ("offset", (page * 200).to_string()),
+                ("start", since.to_string()),
+                ("end", until.to_string()),
+                ("sortBy", "TIMESTAMP".into()),
+                ("sortDirection", "DESC".into()),
+            ])
+            .send().await.ok()?.error_for_status().ok()?.json().await.ok()?;
+        let (rows, complete) = redemption_page(&body, since, until)?;
+        for row in rows {
+            transactions.insert((row.tx.clone(), row.condition), row);
+        }
+        if complete {
+            return Some(transactions.into_values().collect());
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+    use std::io::{BufRead, Write};
+
+    fn row(tx: u8, condition: u8) -> Value {
+        json!({"type":"REDEEM", "timestamp":150,
+            "transactionHash":format!("0x{}", hex::encode([tx; 32])),
+            "conditionId":format!("0x{}", hex::encode([condition; 32]))})
+    }
+    fn server(pages: Vec<(u16, Value)>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let mut paths = Vec::new();
+            for (status, page) in pages {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(std::time::Instant::now() < deadline, "missing discovery request");
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        Err(e) => panic!("{e}"),
+                    }
+                };
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                paths.push(first);
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() { break; }
+                }
+                let body = page.to_string();
+                write!(stream, "HTTP/1.1 {status} Synthetic\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            paths
+        });
+        (url, handle)
+    }
+    async fn discover(pages: Vec<(u16, Value)>) -> (Option<Vec<RedemptionTransaction>>, Vec<String>) {
+        let (url, server) = server(pages);
+        let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(2)).build().unwrap();
+        let result = redemption_transactions(&http, &url, "0x1111111111111111111111111111111111111111", 100, 200).await;
+        (result, server.join().unwrap())
+    }
+
+    #[test]
+    fn malformed_or_out_of_range_activity_is_not_silently_discarded() {
+        let good = row(1, 2);
+        assert_eq!(redemption_page(&json!([good.clone()]), 100, 200).unwrap().0[0].condition, [2; 32]);
+        for (key, value) in [
+            ("type", json!("TRADE")), ("timestamp", json!(99)), ("timestamp", json!(201)),
+            ("conditionId", json!("0x12")), ("transactionHash", json!("0x12")),
+        ] {
+            let mut bad = good.clone();
+            bad[key] = value;
+            assert!(redemption_page(&json!([good.clone(), bad]), 100, 200).is_none());
+        }
+        assert!(redemption_page(&json!({"error":"unavailable"}), 100, 200).is_none());
+        assert!(redemption_page(&json!(vec![good; 201]), 100, 200).is_none());
+    }
+
+    #[tokio::test]
+    async fn complete_scan_preserves_condition_and_deduplicates_per_condition() {
+        let (transactions, requests) = discover(vec![
+            (200, json!(vec![row(1, 2); 200])),
+            (200, json!([row(1, 2), row(1, 3)])),
+        ]).await;
+        let transactions = transactions.unwrap();
+        assert_eq!(transactions.len(), 2);
+        assert_eq!(transactions.iter().filter(|t| t.condition == [2; 32]).count(), 1);
+        assert_eq!(transactions.iter().filter(|t| t.condition == [3; 32]).count(), 1);
+        assert!(requests[1].contains("offset=200"));
+        for request in requests {
+            assert!(request.contains("start=100"));
+            assert!(request.contains("end=200"));
+            assert!(request.contains("sortDirection=DESC"));
+        }
+    }
+
+    #[tokio::test]
+    async fn later_page_failure_never_returns_a_usable_subset() {
+        for second in [(503, json!([])), (200, json!({"error":"unavailable"}))] {
+            let (result, _) = discover(vec![(200, json!(vec![row(1, 2); 200])), second]).await;
+            assert!(result.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn page_limit_without_a_terminal_page_is_incomplete() {
+        let (result, requests) = discover(vec![(200, json!(vec![row(1, 2); 200])); 25]).await;
+        assert!(result.is_none());
+        assert_eq!(requests.len(), 25);
+        assert!(requests[24].contains("offset=4800"));
     }
 }
 

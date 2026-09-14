@@ -166,8 +166,8 @@ def run(days):
         return EXIT_OK
     log('VERDICT: DIVERGED by %+.2f — something moved money our fills do not explain.' % gap)
     log('         Usual suspects, in order: positions the venue could not mark, a')
-    log('         redemption booked at cost awaiting chain proof (settlewatch retries')
-    log('         these every 30 min), an undeclared deposit or withdrawal, or a fee')
+    log('         redemption booked at cost awaiting chain proof (engine settlement retries')
+    log('         these each minute), an undeclared deposit or withdrawal, or a fee')
     log('         the venue charged and we did not record.')
     return EXIT_DIVERGED
 BASELINES = os.path.join(BOT_DIR, 'run', 'equity_baseline.jsonl')

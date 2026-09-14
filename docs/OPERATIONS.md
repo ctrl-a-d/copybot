@@ -29,11 +29,19 @@ Roll back the executable and configuration deliberately. Do not blindly overwrit
 
 ## Resolution and automatic redemption
 
-The engine checks the final CTF payout for tokens still held in its local ledger about once per minute. It discovers the condition and outcome index through Gamma, then reads `payoutDenominator` and `payoutNumerators` through `FILLWATCH_RPC` (default `https://polygon.drpc.org`). `CTF_ADDRESS` may override the default CTF contract, as in the observers. Configure a working read-only RPC before running live.
+The engine checks tracked holdings and pending reconciliation releases about once per minute. It discovers the condition and outcome index through Gamma, verifies the token binding with CTF `getCollectionId`, and reads the payout vector and wallet balance at a finalized block through `FILLWATCH_RPC` (default `https://polygon.drpc.org`). `CTF_ADDRESS` may override the default CTF contract, as in the observers. Configure a working read-only RPC before running live.
 
-This accounting continues when an external redeemer has already removed every token from the wallet's positions API. A final payout clears the tracked shares and cost and records profit or loss once. Empty, missing, unresolved, or malformed responses alone never release exposure; unsuccessful reads are retried. Metadata is cached only while the token remains held. Requests run with bounded concurrency outside the order execution loop.
+Missing tokens alone do not prove redemption. Reconciliation retains their cost as pending settlement evidence. For redeemed inventory, the engine discovers REDEEM transactions through the public activity API and verifies successful canonical receipts, the wallet's token burns, and the condition's payout. Direct CTF, legacy adapter, and supported collateral-wrapper redemptions are recognized, including losing shares with zero payout. Unsupported or incomplete evidence stays pending and is retried. Network reads run outside the order execution loop.
+
+The verified balances and redemption quantities must cover the whole lane pool, including previous settlement credits. Durable counters prevent receipt reuse across lanes and restarts. This assumes the bot tracks the wallet's trading activity; arbitrary manual trades or external transfers can make attribution ambiguous. Preserve unresolved records for investigation. Historical journal mistakes are not automatically rewritten.
+
+The engine owns settlement writes. The legacy `deploy/settlewatch.py --apply` command now refuses to write; its default mode remains diagnostic only. Do not run older settlement writers against the same ledger.
 
 Settlement accounting does not submit a redemption transaction or credit spendable cash. The separate authenticated collateral-balance refresh must observe the returned funds before they can fund another buy. Pending-order reserves and the daily spending limit still apply; redemption does not reset daily turnover.
+
+## Pending-feed health
+
+The pending-transaction connection must produce a valid full-transaction subscription notification within 15 seconds of subscription acknowledgement and at least once every 90 seconds afterward. Ping/Pong and unrelated messages do not reset this deadline. Valid transactions for other destinations do reset it because they prove the provider is delivering the subscribed stream. Expiry reconnects the feed; a live WebSocket alone is not evidence of a healthy transaction stream.
 
 ## Things to check
 
