@@ -12,6 +12,8 @@ pub struct RawTx {
     pub to_neg_risk: bool,
     pub to: String,
     pub seen_ns: u128,
+    pub seen_mono_ns: u128,
+    pub raw_json: String,
 }
 #[derive(Debug, Clone)]
 pub struct FeedConfig {
@@ -74,12 +76,29 @@ pub struct FeedStats {
     pub errors: AtomicU64,
     pub wins: AtomicU64,
     pub recycle: std::sync::atomic::AtomicBool,
+    pub connected: std::sync::atomic::AtomicBool,
+    pub last_frame_mono_ns: AtomicU64,
+    pub received_bytes: AtomicU64,
+    // Zero means unlimited; the passive probe sets a bound for its paid-provider test.
+    pub byte_limit: AtomicU64,
 }
 pub struct FeedRegistry {
     pub per: std::collections::HashMap<String, Arc<FeedStats>>,
     pub total: Arc<FeedStats>,
 }
 impl FeedRegistry {
+    pub fn health_snapshot(&self) -> serde_json::Value {
+        let mut sources = serde_json::Map::new();
+        for (name, s) in &self.per {
+            sources.insert(name.clone(), serde_json::json!({
+                "connected": s.connected.load(Ordering::Acquire),
+                "last_frame_mono_ns": s.last_frame_mono_ns.load(Ordering::Acquire),
+                "received_bytes": s.received_bytes.load(Ordering::Relaxed),
+                "byte_limit": s.byte_limit.load(Ordering::Relaxed)
+            }));
+        }
+        sources.into()
+    }
     pub fn snapshot(&self) -> Vec<(String, u64, u64, u64, u64)> {
         let mut v: Vec<_> = self
             .per
@@ -223,8 +242,14 @@ async fn run_socket(
     const HEALTHY_SESSION: Duration = Duration::from_secs(60);
     let mut consecutive_failures: u32 = 0;
     loop {
+        let limit = stats.own.byte_limit.load(Ordering::Relaxed);
+        if limit > 0 && stats.own.received_bytes.load(Ordering::Relaxed) >= limit {
+            eprintln!("[{name}] configured receive-byte budget exhausted");
+            return;
+        }
         let started = std::time::Instant::now();
         let outcome = pump(&name, &url, &tx, &stats, watched.clone()).await;
+        stats.own.connected.store(false, Ordering::Release);
         let ran = started.elapsed();
         let ended_ok = outcome.is_ok();
         if escalates(ran, ended_ok, HEALTHY_SESSION) {
@@ -232,7 +257,7 @@ async fn run_socket(
             stats.error();
             if let Err(e) = &outcome {
                 if consecutive_failures <= 3 {
-                    eprintln!("[{name}] {e}");
+                    eprintln!("[{name}] {}", redact_provider_error(&url, e));
                 } else if consecutive_failures == 4 {
                     eprintln!("[{name}] repeated failures — backing off, silencing");
                 }
@@ -246,6 +271,27 @@ async fn run_socket(
         stats.reconnect();
         tokio::time::sleep(Duration::from_millis(backoff_ms(consecutive_failures)))
             .await;
+    }
+}
+fn redact_provider_error(url: &str, error: &str) -> String {
+    let mut safe = error.replace(url, "[provider endpoint]");
+    if url.contains("alchemy.com") {
+        if let Some(key) = url.rsplit('/').next().filter(|s| !s.is_empty()) {
+            safe = safe.replace(key, "[credential]");
+        }
+    }
+    safe
+}
+#[cfg(test)]
+mod provider_credential_tests {
+    use super::*;
+    #[test]
+    fn provider_errors_never_echo_alchemy_path_credentials() {
+        let url="wss://polygon-mainnet.g.alchemy.com/v2/private-example-key";
+        let error=format!("connect {url}: rejected private-example-key");
+        let safe=redact_provider_error(url,&error);
+        assert!(!safe.contains("private-example-key"));
+        assert!(!safe.contains(url));
     }
 }
 async fn pump(
@@ -267,7 +313,7 @@ async fn pump(
         to.extend(watched.snapshot().into_iter().map(|a| format!("0x{a}")));
         serde_json::json!(
             { "jsonrpc" : "2.0", "id" : 1, "method" : "eth_subscribe", "params" :
-            ["alchemy_pendingTransactions", { "toAddress" : to }] }
+            ["alchemy_pendingTransactions", { "toAddress" : to, "hashesOnly": false }] }
         )
     } else {
         serde_json::json!(
@@ -291,6 +337,7 @@ async fn pump(
         Ok(None) => return Err("closed before ack".into()),
         Err(_) => return Err("ack timeout".into()),
     }
+    stats.own.connected.store(true, Ordering::Release);
     let mut proved = false;
     loop {
         let next = tokio::time::timeout(
@@ -322,6 +369,17 @@ async fn pump(
             Message::Close(_) => return Ok(()),
             _ => continue,
         };
+        let seen_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts); }
+        let seen_mono_ns = ts.tv_sec as u128 * 1_000_000_000 + ts.tv_nsec as u128;
+        stats.own.last_frame_mono_ns.store(seen_mono_ns as u64, Ordering::Release);
+        let bytes = stats.own.received_bytes.fetch_add(raw.len() as u64, Ordering::Relaxed) + raw.len() as u64;
+        let limit = stats.own.byte_limit.load(Ordering::Relaxed);
+        if limit > 0 && bytes >= limit {
+            return Err("configured receive-byte budget exhausted".into());
+        }
         proved = true;
         stats.frame();
         frames_since_watch_refresh += 1;
@@ -345,10 +403,6 @@ async fn pump(
         if !is_ctf && !is_neg && !is_watched {
             continue;
         }
-        let seen_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
         let v: serde_json::Value = match serde_json::from_str(&raw) {
             Ok(v) => v,
             Err(_) => continue,
@@ -385,6 +439,8 @@ async fn pump(
                 to_neg_risk: neg,
                 to: to.clone(),
                 seen_ns,
+                seen_mono_ns,
+                raw_json: raw,
             })
             .is_err()
         {
