@@ -75,6 +75,8 @@ pub struct LaneToml {
 }
 #[derive(Debug, Deserialize)]
 pub struct SizingToml {
+    #[serde(default)]
+    pub sizing_basis: crate::lanes::SizingBasis,
     pub mode: String,
     #[serde(default)]
     pub fixed_shares: f64,
@@ -148,6 +150,8 @@ fn f070() -> f64 {
 }
 #[derive(Debug, Deserialize)]
 pub struct ExecToml {
+    #[serde(default)]
+    pub allow_opposite_outcomes: bool,
     #[serde(default = "taker")]
     pub mode: String,
     #[serde(default)]
@@ -315,6 +319,8 @@ pub fn build_runtime_lane(
         compound: spec.compound,
         copy_makers: spec.copy_makers,
         exclude_political: spec.exclude_political,
+        sizing_basis: spec.sizing_basis,
+        allow_opposite_outcomes: spec.allow_opposite_outcomes,
     };
     cfg.validate()?;
     let risk = spec
@@ -366,6 +372,8 @@ impl Root {
                 copy_makers: l.execution.copy_makers,
                 copy_maker_sells: Some(l.execution.copy_maker_sells),
                 exclude_political: l.execution.exclude_political,
+                sizing_basis: l.sizing.sizing_basis,
+                allow_opposite_outcomes: l.execution.allow_opposite_outcomes,
                 leader_max_order_usd: l.leader_max_order_usd,
                 leader_peak_exposure_usd: l.leader_peak_exposure_usd,
                 risk: l.risk,
@@ -495,6 +503,8 @@ impl Root {
                 copy_makers: l.execution.copy_makers,
                 copy_maker_sells: l.execution.copy_maker_sells,
                 exclude_political: l.execution.exclude_political,
+                sizing_basis: l.sizing.sizing_basis,
+                allow_opposite_outcomes: l.execution.allow_opposite_outcomes,
             };
             cfg.validate()?;
             out.push(Lane::new(cfg));

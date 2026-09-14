@@ -32,6 +32,26 @@ struct PhysicalWallet {
 fn now_ms() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis()
 }
+struct LaneCashSnapshot {
+    seed_usd: f64,
+    deployed_usd: f64,
+}
+fn decide_with_cash_snapshot(
+    router: &Router,
+    lane: &copybot_hot::lanes::Lane,
+    lane_ix: usize,
+    decoded: &copybot_hot::calldata::Decoded,
+    progress: copybot_hot::signal_guard::Progress,
+) -> (Result<copybot_hot::lanes::Intent, copybot_hot::lanes::Skip>, LaneCashSnapshot) {
+    // decide reserves the candidate in open_usd. Capture cash first so the
+    // affordability check charges it once, even if control refreshes later.
+    let cash = LaneCashSnapshot {
+        seed_usd: lane.policy().seed_usd,
+        deployed_usd: lane.state.open_usd.load(Ordering::Relaxed) as f64 / MICRO,
+    };
+    let decided = router.decide(lane_ix, decoded, progress);
+    (decided, cash)
+}
 #[allow(clippy::too_many_arguments)]
 async fn resolve_pending(
     log: &Arc<std::sync::Mutex<copybot_hot::pending::PendingLog>>,
@@ -625,6 +645,7 @@ user={leader}&limit=500&offset={offset}"
         .len();
     Ok((n, with_balance))
 }
+#[cfg(test)]
 fn recovery_target_shares(
     leader_size: f64,
     leader_avg_price: f64,
@@ -844,9 +865,9 @@ back only one wallet — two would copy every fill twice.",
                         lane_id: None,
                         copy_makers: v["copy_makers"].as_bool().unwrap_or(true),
                         copy_maker_sells: v["copy_maker_sells"].as_bool(),
-                        exclude_political: v["exclude_political"]
-                            .as_bool()
-                            .unwrap_or(false),
+                        exclude_political: v["exclude_political"].as_bool().unwrap_or(false),
+                        sizing_basis: copybot_hot::lanes::SizingBasis::Notional,
+                        allow_opposite_outcomes: false,
                         risk: serde_json::from_value(v["risk"].clone()).ok().flatten(),
                         buy_slippage_c: None,
                         sell_slippage_c: None,
@@ -3274,6 +3295,7 @@ kill switch is inert. Aborting so systemd restarts a coherent process."
                                                         .round() / 100.0, "daily_budget" : lpol.caps.daily_usd,
                                                         "min_buy_price" : band_lo, "max_buy_price" : band_hi,
                                                         "max_effective_pct" : eff_cap, "compound" : compound,
+                                                        "sizing_basis": lane.cfg.sizing_basis, "allow_opposite_outcomes": lane.cfg.allow_opposite_outcomes,
                                                         "effective_pct" : eff_pct, "configured_ceiling" : spec.map(|
                                                         s | s.max_effective_pct), "sizing_fit" : spec.and_then(| s |
                                                         s.leader_stats().ok()).map(| ls | { let cap_fill = lpol.caps
@@ -4588,7 +4610,8 @@ derived but are NOT accepted; every order would be refused. Refusing to continue
                             copybot_hot::lanes::Sizing::Pct(pct) => {
                                 let scale = lane.state.cap_scale.load(Ordering::Relaxed)
                                     as f64 / MICRO;
-                                recovery_target_shares(
+                                copybot_hot::budget::target_shares_with_basis(
+                                    lane.cfg.sizing_basis,
                                     his_sz,
                                     his_avg,
                                     our_avg,
@@ -7627,34 +7650,21 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
                 if raw.source == "txpool" {
                     txstats_fill.rescued.fetch_add(1, Ordering::Relaxed);
                 }
-                if d.side == 0 {
-                    let his_now = control
-                        .lock()
-                        .unwrap()
-                        .observe_his_fill(
-                            &lane.cfg.name,
-                            &d.token_id,
-                            d.side,
-                            d.fill_size,
-                        );
-                    lane.set_his(&d.token_id, his_now);
-                }
                 let mut progress = copybot_hot::signal_guard::Progress {
                     his_filled: d.fill_size,
                     our_copied: 0.0,
                 };
                 if d.side == 0 {
                     if let Some(guard) = &signal_guard {
-                        match guard
-                            .observe(
-                                &d.salt,
-                                &d.condition_id,
-                                &lane.cfg.name,
-                                d.fill_size,
-                                d.order_size,
-                                copybot_hot::ledger::now_secs(),
-                            )
-                        {
+                        let observed = if lane.cfg.sizing_basis == copybot_hot::lanes::SizingBasis::Shares {
+                            guard.observe_fill(&d.salt, &d.condition_id, &lane.cfg.name, &d.token_id,
+                                &format!("{}:{}", raw.hash.to_ascii_lowercase(), d.occurrence),
+                                d.fill_size, copybot_hot::ledger::now_secs())
+                        } else {
+                            guard.observe(&d.salt, &d.condition_id, &lane.cfg.name, d.fill_size,
+                                d.order_size, copybot_hot::ledger::now_secs())
+                        };
+                        match observed {
                             Ok(p) => progress = p,
                             Err(reason) => {
                                 emitter
@@ -7666,16 +7676,26 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
                                             : format!("{reason:?}"), }
                                         ),
                                     );
+                                if matches!(reason, copybot_hot::signal_guard::Refusal::Persistence(_)) {
+                                    latch_buys(&lane, &incidents, "persistence", "signal guard cannot persist source fill");
+                                }
                                 continue;
                             }
                         }
+                    }
+                    let his_now = control.lock().unwrap().observe_his_fill(
+                        &lane.cfg.name, &d.token_id, d.side, d.fill_size,
+                    );
+                    lane.set_his(&d.token_id, his_now);
+                    if let Some(guard) = &signal_guard {
                         if let Err(reason) = guard
-                            .check(
+                            .check_with_policy(
                                 &d.salt,
                                 &d.condition_id,
                                 &lane.cfg.name,
                                 &d.token_id,
                                 copybot_hot::ledger::now_secs(),
+                                lane.cfg.allow_opposite_outcomes,
                             )
                         {
                             emitter
@@ -7714,7 +7734,8 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
                         fps.forget(&d.token_id);
                     }
                 }
-                let decided = router.decide(lane_ix, &d, progress);
+                let (decided, cash_before) =
+                    decide_with_cash_snapshot(&router, &lane, lane_ix, &d, progress);
                 let lane_name = lane.cfg.name.clone();
                 if d.side == 1 {
                     let his_now = control
@@ -7745,11 +7766,9 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
                     }
                     Ok(mut intent) => {
                         if intent.side == 0 {
-                            let pol = lane.policy();
-                            let deployed = lane.state.open_usd.load(Ordering::Relaxed)
-                                as f64 / MICRO;
+                            let deployed = cash_before.deployed_usd;
                             let available = copybot_hot::budget::lane_available(
-                                pol.seed_usd,
+                                cash_before.seed_usd,
                                 deployed,
                             );
                             let (free_cash, cash_age) = physical_wallet
@@ -7780,7 +7799,7 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
                                             "NoCash", "src" : raw.source, "tok" : & intent
                                             .token_id[..intent.token_id.len().min(14)], "cost_usd" :
                                             cost, "lane_available_usd" : available, "lane_seed_usd" :
-                                            pol.seed_usd, "lane_deployed_usd" : deployed,
+                                            cash_before.seed_usd, "lane_deployed_usd" : deployed,
                                             "physical_cash" : free_cash, }
                                         ),
                                     );
@@ -8039,7 +8058,7 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
                                 };
                                 let row = copybot_hot::pending::PendingLog::row_bytes(&p);
                                 if let Err(reason) = guard
-                                    .commit_with(
+                                    .commit_with_wal_policy(
                                         &d.salt,
                                         &d.condition_id,
                                         &lane_name,
@@ -8048,6 +8067,7 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
                                         copybot_hot::ledger::now_secs(),
                                         &wal,
                                         Some(&row),
+                                        lane.cfg.allow_opposite_outcomes,
                                     )
                                 {
                                     if matches!(
@@ -8463,6 +8483,75 @@ not release {unfilled} unfilled shares: {e:?} — this order stays under-copied"
     }
 }
 #[cfg(test)]
+mod cash_snapshot_tests {
+    use super::*;
+    use copybot_hot::lanes::{Execution, Lane, LaneConfig, Sizing, Skip};
+
+    fn candidate(deployed: f64) -> (Router, Arc<Lane>, copybot_hot::calldata::Decoded) {
+        let lane = Lane::new(LaneConfig {
+            name: "cash-test".into(), wallet20: [1; 20], sizing: Sizing::Shares(10.0),
+            execution: Execution::Taker, buy_slippage_c: 0.0, sell_slippage_c: 0.01,
+            copy_maker_sells: false, sell_floor_frac: 0.5, min_order_usd: 1.0,
+            max_usd_per_fill: 100.0, daily_budget_usd: 1000.0, per_market_usd: 100.0,
+            max_open_usd: 100.0, max_buy_price: 0.95, min_buy_price: 0.02,
+            min_fill_floor: false, sell_all_frac: 0.95, max_effective_pct: 1.0,
+            compound: false, copy_makers: false, exclude_political: false,
+            sizing_basis: copybot_hot::lanes::SizingBasis::Notional, allow_opposite_outcomes: false,
+        });
+        lane.mark_ready();
+        lane.state.armed.store(true, Ordering::Relaxed);
+        lane.state.open_usd.store((deployed * MICRO) as i64, Ordering::Relaxed);
+        let mut policy = (*lane.policy()).clone();
+        policy.seed_usd = 100.0;
+        *lane.state.policy.write().unwrap() = Arc::new(policy);
+        let router = Router::new(vec![lane]);
+        let lane = router.lane(0).unwrap();
+        let decoded = copybot_hot::calldata::Decoded {
+            condition_id: [7; 32], token_id: "123".into(), side: 0, price: 0.60,
+            order_size: 100.0, fill_size: 100.0, role: "taker", salt: [9; 32],
+            occurrence: 0,
+        };
+        (router, lane, decoded)
+    }
+
+    fn progress() -> copybot_hot::signal_guard::Progress {
+        copybot_hot::signal_guard::Progress { his_filled: 100.0, our_copied: 0.0 }
+    }
+
+    #[test]
+    fn cash_snapshot_does_not_charge_the_router_reservation_twice() {
+        let (router, lane, decoded) = candidate(90.0);
+        let (decision, cash) = decide_with_cash_snapshot(&router, &lane, 0, &decoded, progress());
+        let intent = decision.unwrap();
+        let cost = intent.usd as f64 / MICRO;
+        assert!((cost - 6.0).abs() < 1e-9);
+        assert!((lane.state.open_usd.load(Ordering::Relaxed) as f64 / MICRO - 96.0).abs() < 1e-9);
+        let available = copybot_hot::budget::lane_available(cash.seed_usd, cash.deployed_usd);
+        assert!(copybot_hot::budget::buy_fits_aged(available, Some(10.0), cost, Some(0)),
+            "$90 deployed plus a $6 order fits a $100 seed; candidate reservation is not another expense");
+        // A control refresh after deciding must not change the affordability snapshot.
+        lane.state.open_usd.store((90.0 * MICRO) as i64, Ordering::Relaxed);
+        assert_eq!(copybot_hot::budget::lane_available(cash.seed_usd, cash.deployed_usd), 10.0);
+    }
+
+    #[test]
+    fn cash_snapshot_preserves_real_budget_and_physical_cash_refusals() {
+        let (router, lane, decoded) = candidate(95.0);
+        let (decision, _) = decide_with_cash_snapshot(&router, &lane, 0, &decoded, progress());
+        assert_eq!(decision, Err(Skip::MaxOpen));
+
+        let (router, lane, decoded) = candidate(90.0);
+        let (decision, cash) = decide_with_cash_snapshot(&router, &lane, 0, &decoded, progress());
+        let cost = decision.unwrap().usd as f64 / MICRO;
+        let available = copybot_hot::budget::lane_available(cash.seed_usd, cash.deployed_usd);
+        assert!(!copybot_hot::budget::buy_fits_aged(available, Some(5.0), cost, Some(0)));
+        assert!(!copybot_hot::budget::buy_fits_aged(available, Some(10.0), cost,
+            Some(copybot_hot::budget::CASH_STALE_SECS + 1)));
+        assert!(!copybot_hot::budget::buy_fits_aged(available, None, cost, None));
+    }
+}
+
+#[cfg(test)]
 mod http_handler_tests {
     fn req_with(ct: &str, origin: Option<&str>) -> String {
         let mut r = String::from(
@@ -8811,6 +8900,8 @@ mod http_handler_tests {
             copy_makers: false,
             copy_maker_sells: Some(false),
             exclude_political: false,
+            sizing_basis: copybot_hot::lanes::SizingBasis::Notional,
+            allow_opposite_outcomes: false,
             risk: None,
             buy_slippage_c: None,
             sell_slippage_c: None,

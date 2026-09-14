@@ -11,12 +11,15 @@ const MAX_FUTURE_SKEW_SECS: i64 = 300;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
     DuplicateOrder,
+    UnverifiedFillHistory,
     MarketCooldown { remaining_secs: i64 },
     InvalidIdentity,
     Persistence(String),
 }
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Entry {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    observed_fills: Vec<String>,
     t: i64,
     salt: String,
     condition: String,
@@ -33,6 +36,7 @@ struct Entry {
 }
 #[derive(Debug, Clone)]
 struct Order {
+    observed_fills: Vec<String>,
     t: i64,
     condition: [u8; 32],
     lane: String,
@@ -101,13 +105,27 @@ fn market_gate(
     lane: &str,
     token: &str,
     now: i64,
+    allow_opposite_outcomes: bool,
 ) -> Result<(), Refusal> {
+    if let Some(order) = state.orders.get(salt) {
+        if order.condition != *condition
+            || (!order.lane.is_empty() && order.lane != lane)
+            || (!order.token.is_empty() && order.token != token)
+        {
+            return Err(Refusal::InvalidIdentity);
+        }
+    }
     for key in [(String::new(), *condition), (lane.to_string(), *condition)] {
         if let Some((t, owner, owner_token)) = state.markets.get(&key) {
             if owner == salt {
                 continue;
             }
             if !owner_token.is_empty() && owner_token == token {
+                continue;
+            }
+            // Only waive an identified lane's outcome restriction. Legacy rows
+            // without token or lane identity retain their conservative gate.
+            if allow_opposite_outcomes && !owner_token.is_empty() && key.0 == lane {
                 continue;
             }
             return Err(Refusal::MarketCooldown {
@@ -212,6 +230,7 @@ impl SignalGuard {
                     let slot = orders
                         .entry(salt)
                         .or_insert(Order {
+                            observed_fills: Vec::new(),
                             t: entry.t,
                             condition,
                             lane: entry.lane.clone(),
@@ -222,6 +241,9 @@ impl SignalGuard {
                         });
                     if slot.token.is_empty() {
                         slot.token = entry.token.clone();
+                    }
+                    for id in &entry.observed_fills {
+                        if !slot.observed_fills.contains(id) { slot.observed_fills.push(id.clone()); }
                     }
                     slot.t = slot.t.max(entry.t);
                     slot.his_filled = slot.his_filled.max(entry.his_filled);
@@ -300,6 +322,7 @@ impl SignalGuard {
             .orders
             .entry(*salt)
             .or_insert(Order {
+                observed_fills: Vec::new(),
                 t: now,
                 condition: *condition,
                 lane: lane.to_string(),
@@ -315,6 +338,49 @@ impl SignalGuard {
             our_copied: (slot.our_copied - slot.our_released).max(0.0),
         })
     }
+    /// Account a distinct source BUY fill without treating its signed minimum
+    /// quantity as a maximum. Persist identity before permitting any copy.
+    pub fn observe_fill(
+        &self, salt: &[u8; 32], condition: &[u8; 32], lane: &str, token: &str,
+        fill_id: &str, fill_size: f64, now: i64,
+    ) -> Result<Progress, Refusal> {
+        if salt.iter().all(|b| *b == 0) || condition.iter().all(|b| *b == 0)
+            || lane.is_empty() || token.is_empty() || fill_id.is_empty()
+            || !fill_size.is_finite() || fill_size <= 0.0 {
+            return Err(Refusal::InvalidIdentity);
+        }
+        let mut state = self.inner.lock().map_err(|_| Refusal::Persistence("signal-guard mutex poisoned".into()))?;
+        expire(&mut state, now);
+        let old = state.orders.get(salt);
+        if let Some(o) = old {
+            if o.condition != *condition || o.lane != lane || o.token != token {
+                return Err(Refusal::InvalidIdentity);
+            }
+            if o.observed_fills.contains(&fill_id.to_string()) { return Err(Refusal::DuplicateOrder); }
+            if o.his_filled > 0.0 && o.observed_fills.is_empty() { return Err(Refusal::UnverifiedFillHistory); }
+        }
+        let mut fills = old.map(|o| o.observed_fills.clone()).unwrap_or_default();
+        fills.push(fill_id.to_string());
+        let entry = Entry {
+            observed_fills: fills, t: now, salt: hex::encode(salt), condition: hex::encode(condition),
+            lane: lane.to_string(), token: token.to_string(),
+            his_filled: old.map(|o| o.his_filled).unwrap_or(0.0) + fill_size,
+            our_copied: old.map(|o| o.our_copied).unwrap_or(0.0),
+            our_released: old.map(|o| o.our_released).unwrap_or(0.0),
+        };
+        if !entry.his_filled.is_finite() { return Err(Refusal::InvalidIdentity); }
+        let line = serde_json::to_vec(&entry).map_err(|e| Refusal::Persistence(e.to_string()))?;
+        state.file.write_all(&line).and_then(|_| state.file.write_all(b"\n"))
+            .and_then(|_| state.file.flush()).and_then(|_| state.file.sync_data())
+            .map_err(|e| Refusal::Persistence(format!("write {}: {e}", self.path.display())))?;
+        let progress = Progress { his_filled: entry.his_filled, our_copied: (entry.our_copied-entry.our_released).max(0.0) };
+        state.orders.insert(*salt, Order {
+            observed_fills: entry.observed_fills, t: now, condition: *condition, lane: lane.to_string(),
+            token: token.to_string(), his_filled: entry.his_filled, our_copied: entry.our_copied,
+            our_released: entry.our_released,
+        });
+        Ok(progress)
+    }
     pub fn check(
         &self,
         salt: &[u8; 32],
@@ -322,6 +388,17 @@ impl SignalGuard {
         lane: &str,
         token: &str,
         now: i64,
+    ) -> Result<(), Refusal> {
+        self.check_with_policy(salt, condition, lane, token, now, false)
+    }
+    pub fn check_with_policy(
+        &self,
+        salt: &[u8; 32],
+        condition: &[u8; 32],
+        lane: &str,
+        token: &str,
+        now: i64,
+        allow_opposite_outcomes: bool,
     ) -> Result<(), Refusal> {
         if salt.iter().all(|&b| b == 0) || condition.iter().all(|&b| b == 0) {
             return Err(Refusal::InvalidIdentity);
@@ -331,7 +408,7 @@ impl SignalGuard {
             .lock()
             .map_err(|_| Refusal::Persistence("signal-guard mutex poisoned".into()))?;
         expire(&mut state, now);
-        market_gate(&state, salt, condition, lane, token, now)
+        market_gate(&state, salt, condition, lane, token, now, allow_opposite_outcomes)
     }
     pub fn commit(
         &self,
@@ -342,7 +419,7 @@ impl SignalGuard {
         shares: f64,
         now: i64,
     ) -> Result<(), Refusal> {
-        self.commit_inner(salt, condition, lane, token, shares, now, None, None)
+        self.commit_inner(salt, condition, lane, token, shares, now, None, None, false)
     }
     pub fn commit_with(
         &self,
@@ -355,7 +432,20 @@ impl SignalGuard {
         wal: &crate::wal::Wal,
         extra: Option<&[u8]>,
     ) -> Result<(), Refusal> {
-        self.commit_inner(salt, condition, lane, token, shares, now, Some(wal), extra)
+        self.commit_inner(salt, condition, lane, token, shares, now, Some(wal), extra, false)
+    }
+    pub fn commit_with_policy(
+        &self, salt: &[u8; 32], condition: &[u8; 32], lane: &str, token: &str,
+        shares: f64, now: i64, allow_opposite_outcomes: bool,
+    ) -> Result<(), Refusal> {
+        self.commit_inner(salt, condition, lane, token, shares, now, None, None, allow_opposite_outcomes)
+    }
+    pub fn commit_with_wal_policy(
+        &self, salt: &[u8; 32], condition: &[u8; 32], lane: &str, token: &str,
+        shares: f64, now: i64, wal: &crate::wal::Wal, extra: Option<&[u8]>,
+        allow_opposite_outcomes: bool,
+    ) -> Result<(), Refusal> {
+        self.commit_inner(salt, condition, lane, token, shares, now, Some(wal), extra, allow_opposite_outcomes)
     }
     fn commit_inner(
         &self,
@@ -367,6 +457,7 @@ impl SignalGuard {
         now: i64,
         wal: Option<&crate::wal::Wal>,
         extra: Option<&[u8]>,
+        allow_opposite_outcomes: bool,
     ) -> Result<(), Refusal> {
         if salt.iter().all(|&b| b == 0) || condition.iter().all(|&b| b == 0) {
             return Err(Refusal::InvalidIdentity);
@@ -379,13 +470,14 @@ impl SignalGuard {
             .lock()
             .map_err(|_| Refusal::Persistence("signal-guard mutex poisoned".into()))?;
         expire(&mut state, now);
-        market_gate(&state, salt, condition, lane, token, now)?;
+        market_gate(&state, salt, condition, lane, token, now, allow_opposite_outcomes)?;
         let (his_filled, already, released) = match state.orders.get(salt) {
             Some(o) if o.condition != *condition => return Err(Refusal::InvalidIdentity),
             Some(o) => (o.his_filled, o.our_copied, o.our_released),
             None => (0.0, 0.0, 0.0),
         };
         let entry = Entry {
+            observed_fills: state.orders.get(salt).map(|o| o.observed_fills.clone()).unwrap_or_default(),
             t: now,
             salt: hex::encode(salt),
             condition: hex::encode(condition),
@@ -422,6 +514,7 @@ impl SignalGuard {
             .orders
             .entry(*salt)
             .or_insert(Order {
+                observed_fills: Vec::new(),
                 t: now,
                 condition: *condition,
                 lane: lane.to_string(),
@@ -469,6 +562,7 @@ impl SignalGuard {
             return Ok(());
         }
         let entry = Entry {
+            observed_fills: o.observed_fills.clone(),
             t: now,
             salt: hex::encode(salt),
             condition: hex::encode(condition),
@@ -531,6 +625,25 @@ mod tests {
         out
     }
     const L: &str = "example_lane_26";
+    #[test]
+    fn a_failed_source_observation_does_not_advance_progress() {
+        let path = temp("source-observation-failure");
+        let g = SignalGuard::open(&path, 1_000).unwrap();
+        // A read-only descriptor rejects writes even when tests run as root.
+        g.inner.lock().unwrap().file = File::open(&path).unwrap();
+        assert!(matches!(
+            g.observe_fill(&key(1), &key(9), L, TOK, "fill-a", 20.0, 1_000),
+            Err(Refusal::Persistence(_))
+        ));
+        assert!(g.inner.lock().unwrap().orders.is_empty());
+        drop(g);
+        let g = SignalGuard::open(&path, 1_001).unwrap();
+        let p = g.observe_fill(&key(1), &key(9), L, TOK, "fill-a", 20.0, 1_001).unwrap();
+        assert_eq!(p.his_filled, 20.0);
+        assert_eq!(p.our_copied, 0.0);
+        drop(g);
+        std::fs::remove_file(path).unwrap();
+    }
     fn first_buy(g: &SignalGuard, salt: u8, cond: u8, shares: f64, now: i64) {
         g.observe(&key(salt), &key(cond), L, shares, shares, now).unwrap();
         g.commit(&key(salt), &key(cond), L, TOK, shares, now).unwrap();

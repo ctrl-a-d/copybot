@@ -51,3 +51,6 @@ pub mod txpool;
 pub mod sweep;
 pub mod venue;
 pub mod wallets;
+
+#[cfg(test)]
+mod copy_policy_tests;

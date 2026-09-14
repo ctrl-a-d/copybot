@@ -623,6 +623,8 @@ mod tests {
             compound: true,
             copy_makers: false,
             exclude_political: false,
+            sizing_basis: crate::lanes::SizingBasis::Notional,
+            allow_opposite_outcomes: false,
         }
     }
     fn setup(

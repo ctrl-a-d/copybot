@@ -13,6 +13,14 @@ pub enum Sizing {
     Usd(f64),
     Pct(f64),
 }
+/// The quantity preserved by percentage sizing. Existing lanes retain notional sizing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SizingBasis {
+    #[default]
+    Notional,
+    Shares,
+}
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Execution {
     Taker,
@@ -25,6 +33,7 @@ pub enum Skip {
     TokenOwnedByOtherLane,
     DailyBudget,
     PerMarketCap,
+    PerFillCap,
     MaxOpen,
     PriceOutOfBand,
     BelowVenueMinimum,
@@ -53,6 +62,8 @@ pub struct Intent {
 }
 #[derive(Debug, Clone)]
 pub struct LaneConfig {
+    pub sizing_basis: SizingBasis,
+    pub allow_opposite_outcomes: bool,
     pub name: String,
     pub wallet20: [u8; 20],
     pub sizing: Sizing,
@@ -77,6 +88,14 @@ pub struct LaneConfig {
 }
 impl LaneConfig {
     pub fn validate(&self) -> Result<(), String> {
+        if self.sizing_basis == SizingBasis::Shares {
+            if !matches!(self.sizing, Sizing::Pct(_)) {
+                return Err("share basis requires percentage sizing".into());
+            }
+            if self.min_fill_floor {
+                return Err("share basis requires min_fill_floor=false to avoid enlarging small buys".into());
+            }
+        }
         if self.max_usd_per_fill > self.per_market_usd {
             return Err(
                 format!(
@@ -518,8 +537,11 @@ impl Router {
                         scale,
                         pol.max_effective_pct,
                         pol.compound,
-                    ) * (d.price / limit);
-                whole(target - progress.our_copied)
+                    );
+                match c.sizing_basis {
+                    SizingBasis::Notional => whole(target * (d.price / limit) - progress.our_copied),
+                    SizingBasis::Shares => crate::venue::sell_shares((target - progress.our_copied).max(0.0)),
+                }
             }
         };
         let first_clip = progress.our_copied <= 0.0;
@@ -542,6 +564,9 @@ impl Router {
         }
         let cap_fill = pol.caps.max_usd_per_fill * scale;
         if usd > cap_fill {
+            if c.sizing_basis == SizingBasis::Shares {
+                return Err(Skip::PerFillCap);
+            }
             shares = whole(cap_fill / limit);
             if shares <= 0.0 {
                 return Err(Skip::DustAfterSizing);
@@ -751,6 +776,8 @@ mod tests {
             copy_makers: false,
             compound: true,
             exclude_political: false,
+            sizing_basis: crate::lanes::SizingBasis::Notional,
+            allow_opposite_outcomes: false,
         }
     }
     fn dec(tok: &str, side: u8, price: f64, fill: f64, order: f64) -> Decoded {
@@ -2362,6 +2389,8 @@ mod route_tests {
             copy_makers: false,
             compound: true,
             exclude_political: false,
+            sizing_basis: crate::lanes::SizingBasis::Notional,
+            allow_opposite_outcomes: false,
         }
     }
     #[test]

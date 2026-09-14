@@ -264,6 +264,25 @@ pub fn target_shares(
     let venue_floor = min_order_usd.max(0.0) / our_avg_price;
     Some(proportional.max(venue_floor) + 1.0)
 }
+/// Recovery ceiling in the same units as entry sizing. One quantity tick of
+/// tolerance avoids treating rounding dust as an oversized position.
+pub fn target_shares_with_basis(
+    basis: crate::lanes::SizingBasis,
+    leader_size: f64, leader_avg_price: f64, our_avg_price: f64,
+    pct: f64, scale: f64, min_order_usd: f64, max_effective_pct: f64, compound: bool,
+) -> Option<f64> {
+    if basis == crate::lanes::SizingBasis::Notional {
+        return target_shares(leader_size, leader_avg_price, our_avg_price, pct, scale,
+            min_order_usd, max_effective_pct, compound);
+    }
+    if !leader_size.is_finite() || leader_size < 0.0 || !pct.is_finite()
+        || pct <= 0.0 || !scale.is_finite() || scale <= 0.0
+        || !max_effective_pct.is_finite() || max_effective_pct <= 0.0 {
+        return None;
+    }
+    if leader_size <= 1e-9 { return Some(0.0); }
+    Some(leader_size * effective_pct(pct, scale, max_effective_pct, compound) + 0.01)
+}
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -2,6 +2,10 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WalletSpec {
+    #[serde(default)]
+    pub sizing_basis: crate::lanes::SizingBasis,
+    #[serde(default)]
+    pub allow_opposite_outcomes: bool,
     pub name: String,
     pub leader: String,
     pub seed_usd: f64,

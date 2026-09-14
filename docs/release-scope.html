@@ -1,31 +1,21 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#020704"><title>What this package changes—and what it does not · Abomination81 Copybot</title><link rel="icon" href="assets/copybot-mark.svg?v=abom2"><link rel="stylesheet" href="styles.css"><link rel="stylesheet" href="guide.css"></head>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#020704"><title>Source and release scope · Abomination81 Copybot</title><link rel="icon" href="assets/copybot-mark.svg?v=abom2"><link rel="stylesheet" href="styles.css"><link rel="stylesheet" href="guide.css"></head>
 <body><a class="skip" href="#guide">Skip to guide</a><header class="site-header wrap"><a class="brand" href="index.html"><img src="assets/copybot-mark.svg?v=abom2" width="42" height="42" alt=""><span>Abomination81 Copybot<small>Independent execution. Built to be yours.</small></span></a><nav aria-label="Main navigation"><a href="index.html">Project home</a><a href="https://x.com/Abomination81" target="_blank" rel="noopener noreferrer">X ↗</a><a class="nav-github" href="https://github.com/Abomination81/copybot">GitHub ↗</a></nav></header>
-<main class="wrap guide-layout"><aside><p class="eyebrow">Operator guides</p><nav aria-label="Guide navigation"><a href="install.html">Install</a><a href="configuration.html">Configuration</a><a href="operations.html">Operations</a><a href="release-scope.html" aria-current="page">Release Scope</a></nav><p>Private source preview.<br>No live connection.</p></aside><article id="guide"><h1>What this package changes—and what it does not</h1>
-<p>This is a clean source distribution, not a trading rewrite.</p>
-<h2>Preserved</h2>
+<main class="wrap guide-layout"><aside><p class="eyebrow">Operator guides</p><nav aria-label="Guide navigation"><a href="install.html">Install</a><a href="configuration.html">Configuration</a><a href="operations.html">Operations</a><a href="release-scope.html" aria-current="page">Release Scope</a></nav><p>Private source preview.<br>No live connection.</p></aside><article id="guide"><h1>Source and release scope</h1>
+<p>This fork retains the existing execution engine and adds optional, general copying policies. The new settings and their limits are described in <a href="configuration.html">Configuration</a>.</p>
+<h2>Changes in the proportional-copy branch</h2>
 <ul>
-<li>Every production Rust module used by <code>copybot-hot</code>.</li>
-<li>Order signing, protocol constants, feed handling, sizing, execution, ledger, reconciliation, guardian rules, and dashboard calculations.</li>
-<li>Rust dependency versions from the local lockfile.</li>
-<li>The actual operator dashboard and the chart library's upstream notice.</li>
-<li>Self-contained regression tests that do not carry private chain data.</li>
+<li>Optional share-based percentage sizing, including cumulative partial fills and recovery in the same units.</li>
+<li>Optional opposite-outcome copying while retaining identity, duplicate-fill, persistence and spending checks.</li>
+<li>Durable source-fill identities for share mode, including restart and write-ahead-log recovery tests.</li>
+<li>Existing decoder, feed-liveness and cash-reservation fixes carried into the development base. Decoder tests use synthetic order payloads.</li>
+<li>Compatibility defaults for old configurations; examples stay disabled and dry.</li>
 </ul>
-<p>The private preparation check compares canonical Rust syntax after removing comments and test-only modules from both trees. All production modules must match. Python executable structure is compared separately; only identity/configuration strings and documentation are scrubbed. Deployment paths and users are templated for a new install.</p>
-<h2>Excluded</h2>
-<ul>
-<li>Previous Git history and private author/host metadata.</li>
-<li>Populated environment/configuration, wallets, leader identities, and operator intent.</li>
-<li>Trading tapes, ABI transaction payloads, token lists, portfolio snapshots, P&amp;L exports, and simulator state.</li>
-<li>Private research, incident narratives, historical measurements, screenshots, and audit handoffs.</li>
-<li>Diagnostic/manual-trading binaries outside the production package's single-executable scope.</li>
-<li>Tests whose recorded-chain fixtures would identify accounts or markets.</li>
-</ul>
-<p>Research-heavy source comments and docstrings are removed in the export; maintainers keep the original annotated source privately. The GitHub package has new standalone documentation. The tests shipped here are not the complete private regression corpus. No deleted test is counted as passing.</p>
-<h2>Configuration changes only</h2>
-<p>Operator-specific Python fallback wallets are emptied, private identity labels are anonymized, and host paths are replaced with <code>/opt/copybot</code>. The new operator must supply their values through the existing configuration mechanisms. No credentials are generated or retrieved for them. Default numerical trading rules in production source are not rewritten.</p>
-<p>The example configuration is illustrative and deliberately unusable until completed. It is not the previous operator's strategy. The package does not install or start services, arm a lane, transfer funds, rotate credentials, change an existing repository, or publish the documentation website.</p>
-<h2>Private preview</h2>
-<p>The repository is private. <code>docs/index.html</code> is a static presentation/installation page prepared for a future publication decision; it has no API connection, tracking, wallet integration, or live data. GitHub Pages is not enabled by this package. Private repository visibility does not by itself imply that a Pages website would be private.</p>
+<p>These are runtime changes and require regression checks. Earlier source-export equivalence checks described the original packaging baseline, not this branch. No branch build is automatically deployed, armed, funded or published.</p>
+<h2>Preserved components</h2>
+<p>Order signing, network transports, execution, accounting, redemption and the dashboard remain part of one engine. Existing price limits, exposure limits and optional settlement gates are not automatically widened by the new policy. Dependencies remain pinned by the existing lockfile.</p>
+<h2>Excluded material</h2>
+<p>The public source must not include populated credentials or wallet configuration, selected trader identities, private research, recorded chain payloads, trading tapes, portfolio snapshots, PnL reports, operator logs or deployment-specific details. Only synthetic, self-contained regression fixtures belong in the distributed test suite. Historical private recordings can be used outside the source tree for local verification.</p>
+<p>Run the release privacy check and an independent credential scanner before publishing. Operator state, research and runtime data must stay outside versioned source. Passing those checks is not evidence of trading profitability or execution quality.</p>
 </article></main>
 <footer class="wrap"><a href="index.html">Abomination81 Copybot</a><span>Independent software. Not affiliated with Polymarket.</span><a href="https://x.com/Abomination81">X @Abomination81 ↗</a></footer></body></html>
