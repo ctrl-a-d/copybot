@@ -1086,7 +1086,10 @@ mod tests {
     }
     #[test]
     fn a_FAILED_resolution_LATCHES_instead_of_closing_quietly() {
-        let mut l = PendingLog::open("/nonexistent-dir-cb2/pending.jsonl");
+        // A regular file cannot be a parent directory, including when tests run as root.
+        let parent = std::env::temp_dir().join(format!("pending-parent-file-{}", std::process::id()));
+        std::fs::write(&parent, b"not a directory").unwrap();
+        let mut l = PendingLog::open(parent.join("pending.jsonl").to_str().unwrap());
         let receipt = crate::ledger::Booked {
             shares: 5.0,
             price: 0.4,
@@ -1096,6 +1099,7 @@ mod tests {
             "an unwritable resolution must be reported, not swallowed"
         );
         assert!(! l.persistence_ok(), "and it must LATCH so the buy gate can see it");
+        std::fs::remove_file(parent).unwrap();
     }
     #[test]
     fn a_re_record_of_the_same_digest_does_not_duplicate_on_replay() {
