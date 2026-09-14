@@ -294,12 +294,51 @@ mod provider_credential_tests {
         assert!(!safe.contains(url));
     }
 }
+// Inspect the subscription envelope before the destination prefilter without
+// allocating a full JSON tree for every unrelated pending transaction.
+fn is_transaction_notification(raw: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Notification<'a> {
+        method: &'a str,
+        #[serde(borrow)]
+        params: Params<'a>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Params<'a> {
+        #[serde(borrow)]
+        result: Transaction<'a>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Transaction<'a> {
+        hash: &'a str,
+        input: &'a str,
+    }
+    let Ok(n) = serde_json::from_str::<Notification<'_>>(raw) else { return false; };
+    n.method == "eth_subscription"
+        && n.params.result.hash.len() == 66
+        && n.params.result.hash.starts_with("0x")
+        && n.params.result.hash[2..].bytes().all(|b| b.is_ascii_hexdigit())
+        && n.params.result.input.starts_with("0x")
+        && n.params.result.input.len() % 2 == 0
+        && n.params.result.input[2..].bytes().all(|b| b.is_ascii_hexdigit())
+}
 async fn pump(
     name: &str,
     url: &str,
     out: &mpsc::UnboundedSender<RawTx>,
     stats: &StatsSink,
     watched: Arc<WatchedAddresses>,
+) -> Result<(), String> {
+    pump_with_timeouts(name, url, out, stats, watched, PROVE_TIMEOUT, Duration::from_secs(90)).await
+}
+async fn pump_with_timeouts(
+    name: &str,
+    url: &str,
+    out: &mpsc::UnboundedSender<RawTx>,
+    stats: &StatsSink,
+    watched: Arc<WatchedAddresses>,
+    prove_timeout: Duration,
+    idle_timeout: Duration,
 ) -> Result<(), String> {
     let mut watch_list: Vec<String> = watched.snapshot();
     let mut frames_since_watch_refresh: u32 = 0;
@@ -339,12 +378,15 @@ async fn pump(
     }
     stats.own.connected.store(true, Ordering::Release);
     let mut proved = false;
+    let mut deadline = tokio::time::Instant::now() + prove_timeout;
     loop {
-        let next = tokio::time::timeout(
-                if proved { Duration::from_secs(90) } else { PROVE_TIMEOUT },
-                ws.next(),
-            )
-            .await;
+        // A transport heartbeat does not prove the pending subscription works.
+        // Check explicitly too: an always-ready stream must not starve expiry.
+        let next = if tokio::time::Instant::now() >= deadline {
+            Err(())
+        } else {
+            tokio::time::timeout_at(deadline, ws.next()).await.map_err(|_| ())
+        };
         if stats.take_recycle() {
             return Ok(());
         }
@@ -360,8 +402,8 @@ async fn pump(
         let raw = match msg {
             Message::Text(t) => t,
             Message::Ping(p) => {
-                if ws.send(Message::Pong(p)).await.is_err() {
-                    return Err("pong send failed".into());
+                if !matches!(tokio::time::timeout_at(deadline, ws.send(Message::Pong(p))).await, Ok(Ok(()))) {
+                    return Err("pong send failed or timed out".into());
                 }
                 continue;
             }
@@ -374,13 +416,17 @@ async fn pump(
         let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts); }
         let seen_mono_ns = ts.tv_sec as u128 * 1_000_000_000 + ts.tv_nsec as u128;
-        stats.own.last_frame_mono_ns.store(seen_mono_ns as u64, Ordering::Release);
         let bytes = stats.own.received_bytes.fetch_add(raw.len() as u64, Ordering::Relaxed) + raw.len() as u64;
         let limit = stats.own.byte_limit.load(Ordering::Relaxed);
         if limit > 0 && bytes >= limit {
             return Err("configured receive-byte budget exhausted".into());
         }
+        if !is_transaction_notification(&raw) {
+            continue;
+        }
         proved = true;
+        deadline = tokio::time::Instant::now() + idle_timeout;
+        stats.own.last_frame_mono_ns.store(seen_mono_ns as u64, Ordering::Release);
         stats.frame();
         frames_since_watch_refresh += 1;
         if frames_since_watch_refresh >= WATCH_REFRESH_FRAMES {
@@ -446,5 +492,104 @@ async fn pump(
         {
             return Ok(());
         }
+    }
+}
+
+#[cfg(test)]
+mod subscription_watchdog_tests {
+    use super::*;
+
+    fn notification(to: &str) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0", "method": "eth_subscription",
+            "params": {"subscription": "synthetic", "result": {
+                "hash": format!("0x{}", "12".repeat(32)),
+                "to": format!("0x{to}"), "input": "0x12345678"
+            }}
+        }).to_string()
+    }
+
+    async fn run_stream(
+        messages: Vec<Message>,
+        period: Duration,
+        byte_limit: u64,
+    ) -> (Result<(), String>, Arc<FeedStats>, Vec<RawTx>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _subscription = ws.next().await.unwrap().unwrap();
+            ws.send(Message::Text(r#"{"jsonrpc":"2.0","id":1,"result":"synthetic"}"#.into())).await.unwrap();
+            let mut interval = tokio::time::interval(period);
+            for message in messages {
+                interval.tick().await;
+                if ws.send(message).await.is_err() { return; }
+            }
+            let _ = ws.close(None).await;
+        });
+        let own = Arc::new(FeedStats::default());
+        own.byte_limit.store(byte_limit, Ordering::Relaxed);
+        let stats = StatsSink { own: own.clone(), total: Arc::new(FeedStats::default()) };
+        let (out, mut received) = mpsc::unbounded_channel();
+        let result = tokio::time::timeout(Duration::from_secs(2), pump_with_timeouts(
+            "synthetic", &format!("ws://{addr}"), &out, &stats,
+            Arc::new(WatchedAddresses::new()), Duration::from_millis(100), Duration::from_millis(150),
+        )).await.expect("watchdog failed to terminate");
+        server.abort();
+        let mut forwarded = Vec::new();
+        while let Ok(tx) = received.try_recv() { forwarded.push(tx); }
+        (result, own, forwarded)
+    }
+
+    #[tokio::test]
+    async fn ping_pong_only_stream_expires_without_proving_subscription() {
+        let messages = (0..100).map(|i| if i % 2 == 0 {
+            Message::Ping(vec![1])
+        } else { Message::Pong(vec![1]) }).collect();
+        let (result, stats, forwarded) = run_stream(messages, Duration::from_millis(5), 0).await;
+        assert!(result.unwrap_err().contains("black hole"));
+        assert_eq!(stats.frames.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.last_frame_mono_ns.load(Ordering::Relaxed), 0);
+        assert!(forwarded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn valid_notification_then_unrelated_text_expires_idle_deadline() {
+        let mut messages = vec![Message::Text(notification(CTF_EXCHANGE_V2))];
+        messages.extend((0..100).map(|_| Message::Text(r#"{"jsonrpc":"2.0","id":8,"result":"alive"}"#.into())));
+        let (result, stats, forwarded) = run_stream(messages, Duration::from_millis(5), 0).await;
+        assert!(result.unwrap_err().contains("silent past"));
+        assert_eq!(stats.frames.load(Ordering::Relaxed), 1);
+        assert_eq!(forwarded.len(), 1);
+        assert_eq!(forwarded[0].input, [0x12, 0x34, 0x56, 0x78]);
+    }
+
+    #[tokio::test]
+    async fn unrelated_valid_transactions_keep_subscription_alive() {
+        let messages = vec![Message::Text(notification(&"ab".repeat(20))); 8];
+        let (result, stats, forwarded) = run_stream(messages, Duration::from_millis(40), 0).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(stats.frames.load(Ordering::Relaxed), 8);
+        assert!(stats.last_frame_mono_ns.load(Ordering::Relaxed) > 0);
+        assert!(forwarded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unrelated_text_still_counts_towards_receive_budget() {
+        let (result, stats, _) = run_stream(vec![Message::Text("not a transaction".into())], Duration::from_millis(5), 1).await;
+        assert!(result.unwrap_err().contains("receive-byte budget"));
+        assert!(stats.received_bytes.load(Ordering::Relaxed) > 1);
+        assert_eq!(stats.frames.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn only_full_transaction_notifications_prove_subscription() {
+        let valid = notification(CTF_EXCHANGE_V2);
+        assert!(is_transaction_notification(&valid));
+        assert!(!is_transaction_notification(&valid.replace("eth_subscription", "heartbeat")));
+        assert!(!is_transaction_notification(&valid.replace("0x12345678", "0x1234567g")));
+        assert!(!is_transaction_notification(r#"{"method":"eth_subscription","params":{"result":"0x1234"}}"#));
+        assert!(!is_transaction_notification(r#"{"method":"eth_subscription","params":{"result":{"hash":"bad","input":"0x"}}}"#));
     }
 }
