@@ -37,6 +37,10 @@ pub mod positions;
 pub mod provenance;
 pub mod settlement;
 pub mod resolution;
+pub mod redemption;
+pub mod token_binding;
+#[cfg(test)]
+mod resolution_pool_tests;
 pub mod signal_guard;
 pub mod wal;
 pub mod presign;

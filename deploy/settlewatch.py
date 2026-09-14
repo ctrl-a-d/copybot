@@ -89,19 +89,15 @@ def append_adjustment(lane, token, shares, payout, avg_cost, key, dry_run):
     proceeds = shares * payout
     row = {'ev': 'realised_adjust', 'lane': lane, 'token': token, 'shares': round(shares, 6), 'proceeds': round(proceeds, 6), 'avg_cost': avg_cost, 'pnl': round(proceeds - shares * avg_cost, 6), 'why': 'settlement missed by the redeemable-poll: the auto-redemption relayer swept this position before the booker saw it, and the reconciler then released it P&L-neutral', 'key': key, 't': int(time.time())}
     if dry_run:
-        log('  WOULD BOOK %s' % json.dumps(row))
+        log('  DIAGNOSTIC ONLY (redemption evidence still required): %s' % json.dumps(row))
         return True
-    try:
-        with open(LEDGER, 'a') as f:
-            f.write(json.dumps(row) + '\n')
-            f.flush()
-            os.fsync(f.fileno())
-        return True
-    except OSError as e:
-        log('  could not append: %s' % e)
-        return False
+    log('REFUSED: settlement accounting is owned by the engine; direct ledger writes are disabled')
+    return False
 
 def run(dry_run=True, limit=None):
+    if not dry_run:
+        log("REFUSED: --apply is retired; the engine verifies redemption evidence and owns settlement writes")
+        return 2
     rel = released_phantoms()
     if not rel:
         log('PASS: no released phantoms to check')
