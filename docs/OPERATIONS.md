@@ -27,6 +27,14 @@ Before an upgrade, stop the instance cleanly and take a consistent backup of its
 
 Roll back the executable and configuration deliberately. Do not blindly overwrite newer accounting with an old backup after trades have occurred: restoring old state can duplicate orders or discard fills. Reconcile changed holdings and unknown outcomes before resuming.
 
+## Resolution and automatic redemption
+
+The engine checks the final CTF payout for tokens still held in its local ledger about once per minute. It discovers the condition and outcome index through Gamma, then reads `payoutDenominator` and `payoutNumerators` through `FILLWATCH_RPC` (default `https://polygon.drpc.org`). `CTF_ADDRESS` may override the default CTF contract, as in the observers. Configure a working read-only RPC before running live.
+
+This accounting continues when an external redeemer has already removed every token from the wallet's positions API. A final payout clears the tracked shares and cost and records profit or loss once. Empty, missing, unresolved, or malformed responses alone never release exposure; unsuccessful reads are retried. Metadata is cached only while the token remains held. Requests run with bounded concurrency outside the order execution loop.
+
+Settlement accounting does not submit a redemption transaction or credit spendable cash. The separate authenticated collateral-balance refresh must observe the returned funds before they can fund another buy. Pending-order reserves and the daily spending limit still apply; redemption does not reset daily turnover.
+
 ## Things to check
 
 - Fresh feed and observer timestamps, not just an active process.

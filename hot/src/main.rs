@@ -6722,50 +6722,34 @@ this as a bad read, not a mass cancellation",
     }
     const SETTLE_CLOCK_SLOP_SECS: i64 = 120;
     if live {
-        let (ctl, rt, em, fund) = (
-            control.clone(),
-            router.clone(),
-            emitter.clone(),
-            funder.clone(),
-        );
+        let (ctl, rt, em) = (control.clone(), router.clone(), emitter.clone());
+        let rpc = std::env::var("FILLWATCH_RPC")
+            .unwrap_or_else(|_| "https://polygon.drpc.org".into());
+        let ctf = std::env::var("CTF_ADDRESS")
+            .unwrap_or_else(|_| format!("0x{}", hex::encode(copybot_hot::merge::CTF)));
         tokio::spawn(async move {
             let http = reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
+                .user_agent("copybot-resolution")
+                .timeout(Duration::from_secs(10))
                 .build()
                 .unwrap_or_default();
+            let mut resolver = copybot_hot::resolution::Resolver::default();
             let mut tick = tokio::time::interval(Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tick.tick().await;
-                let url = format!(
-                    "https://data-api.polymarket.com/positions?user={fund}\
-&sizeThreshold=0.0001&limit=500&redeemable=true"
-                );
-                let rows: Vec<serde_json::Value> = match http.get(&url).send().await {
-                    Ok(r) if r.status().is_success() => {
-                        r.json().await.unwrap_or_default()
-                    }
-                    _ => continue,
+                // Automatic redemption may remove every token from /positions.
+                // Start from our ledger and require final on-chain payout evidence.
+                let tokens: Vec<String> = {
+                    let g = ctl.lock().unwrap();
+                    rt.snapshot().iter()
+                        .flat_map(|lane| g.ledger.holdings(&lane.cfg.name).into_keys())
+                        .collect::<std::collections::HashSet<_>>()
+                        .into_iter().collect()
                 };
-                let mut payout: std::collections::HashMap<String, f64> = Default::default();
-                for p in &rows {
-                    let view = copybot_hot::settlement::PositionView {
-                        redeemable: p["redeemable"].as_bool().unwrap_or(false),
-                        cur_price: p["curPrice"]
-                            .as_f64()
-                            .or_else(|| {
-                                p["curPrice"].as_str().and_then(|x| x.parse().ok())
-                            })
-                            .unwrap_or(0.0),
-                    };
-                    if let (Some(tok), Some(pay)) = (
-                        p["asset"].as_str(),
-                        copybot_hot::settlement::resolved_payout(view),
-                    ) {
-                        if !tok.is_empty() {
-                            payout.insert(tok.to_string(), pay);
-                        }
-                    }
-                }
+                let payout = resolver.payouts(
+                    &http, "https://gamma-api.polymarket.com", &rpc, &ctf, &tokens,
+                ).await;
                 if payout.is_empty() {
                     continue;
                 }
@@ -6775,30 +6759,20 @@ this as a bad read, not a mass cancellation",
                     for tok in held.keys() {
                         let Some(&pay) = payout.get(tok) else { continue };
                         let mut g = ctl.lock().unwrap();
-                        let before = g
-                            .ledger
-                            .lanes
-                            .get(&name)
-                            .map(|b| b.risk.realised_pnl)
-                            .unwrap_or(0.0);
-                        g.ledger.record_settlement(&name, tok, pay);
-                        let after = g
-                            .ledger
-                            .lanes
-                            .get(&name)
-                            .map(|b| b.risk.realised_pnl)
-                            .unwrap_or(0.0);
+                        let Some(delta) = copybot_hot::resolution::book(
+                            &mut g.ledger, &name, tok, pay,
+                        ) else { continue };
                         drop(g);
                         eprintln!(
                             "[settle] {name}: token …{} resolved at {pay:.3} \
                                    -> realised {:+.2}",
-                            & tok[tok.len().saturating_sub(8)..], after - before
+                            & tok[tok.len().saturating_sub(8)..], delta
                         );
                         em.emit(
                             serde_json::json!(
                                 { "t" : now_ms(), "ev" : "settle", "lane" : name, "tok" : &
                                 tok[..tok.len().min(14)], "payout" : pay, "realised_delta" :
-                                ((after - before) * 100.0).round() / 100.0 }
+                                (delta * 100.0).round() / 100.0 }
                             ),
                         );
                     }
