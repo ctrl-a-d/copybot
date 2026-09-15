@@ -353,6 +353,16 @@ impl Root {
             .filter_map(|l| l.budget.bankroll_usd)
             .sum()
     }
+    pub fn repricing_fracs(&self) -> std::collections::HashMap<String, crate::budget::Fracs> {
+        self.lane.iter().filter(|l| l.enabled && l.budget.bankroll_usd.is_some()).map(|l| {
+            (l.wallet.to_ascii_lowercase(), crate::budget::Fracs {
+                open: l.budget.open_frac,
+                per_market: l.budget.per_market_frac,
+                per_fill: l.budget.per_fill_frac,
+                daily: l.budget.daily_frac,
+            })
+        }).collect()
+    }
     pub fn wallet_specs(&self) -> Vec<crate::wallets::WalletSpec> {
         self.lane
             .iter()
@@ -513,5 +523,50 @@ impl Root {
             return Err("no enabled lanes — nothing to copy".into());
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod repricing_tests {
+    use super::*;
+
+    #[test]
+    fn live_repricing_preserves_configured_budget_fractions() {
+        let mut root: Root = toml::from_str(include_str!("../../deploy/copybot2.example.toml")).unwrap();
+        let l = &mut root.lane[0];
+        l.enabled = true;
+        l.wallet = "0x0000000000000000000000000000000000000001".into();
+        l.leader_max_order_usd = Some(50.0);
+        l.leader_peak_exposure_usd = Some(100.0);
+        l.sizing.pct = 1.0;
+        l.sizing.max_effective_pct = 1.0;
+        l.sizing.min_fill_floor = false;
+        l.sizing.sizing_basis = crate::lanes::SizingBasis::Shares;
+        l.budget.bankroll_usd = Some(200.0);
+        l.budget.open_frac = 0.95;
+        l.budget.per_market_frac = 1.0;
+        l.budget.per_fill_frac = 1.0;
+        l.budget.daily_frac = 1000.0 / 190.0;
+        let mut other: Root = toml::from_str(include_str!("../../deploy/copybot2.example.toml")).unwrap();
+        let mut disabled = other.lane.remove(0);
+        disabled.wallet = root.lane[0].wallet.clone();
+        disabled.budget.bankroll_usd = Some(200.0);
+        disabled.enabled = false;
+        disabled.budget.open_frac = 0.1;
+        root.lane.push(disabled);
+        let boot = root.build_lanes().unwrap();
+        let specs = root.wallet_specs();
+        let fracs = root.repricing_fracs();
+        for seed in [200.0, 400.0] {
+            let policy = crate::lanes::SizingPolicy::build(
+                1, seed, Sizing::Pct(specs[0].pct), specs[0].max_effective_pct,
+                specs[0].compound, &fracs[&specs[0].leader],
+            ).unwrap();
+            let scale = seed / 200.0;
+            assert!((policy.caps.max_open_usd - boot[0].cfg.max_open_usd * scale).abs() < 1e-8);
+            assert!((policy.caps.per_market_usd - boot[0].cfg.per_market_usd * scale).abs() < 1e-8);
+            assert!((policy.caps.max_usd_per_fill - boot[0].cfg.max_usd_per_fill * scale).abs() < 1e-8);
+            assert!((policy.caps.daily_usd - boot[0].cfg.daily_budget_usd * scale).abs() < 1e-8);
+        }
     }
 }

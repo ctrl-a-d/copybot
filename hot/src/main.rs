@@ -5967,6 +5967,7 @@ naked exposure and is flattened regardless of the merge outcome"
         let ev_rt = emitter.clone();
         let watched_rt = watched_addrs.clone();
         let pl_rt = pair_ledger.clone();
+        let configured_fracs = root.repricing_fracs();
         tokio::spawn(async move {
             let http_rt = reqwest::Client::builder()
                 .timeout(Duration::from_secs(20))
@@ -6053,7 +6054,8 @@ naked exposure and is flattened regardless of the merge outcome"
                         copybot_hot::lanes::Sizing::Pct(rp.spec.pct),
                         rp.spec.max_effective_pct,
                         rp.spec.compound,
-                        &copybot_hot::budget::Fracs::default(),
+                        &configured_fracs.get(&rp.spec.leader.to_ascii_lowercase())
+                            .copied().unwrap_or_default(),
                     );
                     let hybrid = lane.cfg.execution
                         == copybot_hot::lanes::Execution::Hybrid;
