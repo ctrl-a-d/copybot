@@ -9,7 +9,8 @@ const BATCH: &str = "4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c
 const TRANSFER: &str = "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const PAYOUT: &str = "2682012a4a4f1973119f1c9b90745d1bd91fa2bab387344f044cb3586864d18d";
 const LEGACY_PAYOUT: &str = "9140a6a270ef945260c03894b3c6b3b2695e9d5101feef0ff24fec960cfd3224";
-const WRAPPER_PAYOUT: &str = "74a51ebefec30281ec6849b727ec7916f9b1a3e5e148d6771d98315215b38b96";
+const LEGACY_WRAPPER_PAYOUT: &str = "74a51ebefec30281ec6849b727ec7916f9b1a3e5e148d6771d98315215b38b96";
+const WRAPPER_PAYOUT: &str = "b434294b5904213c83a167af0068ab82637c6fd4fac945e2abc74ed8d3f4d52a";
 const LEGACY_ADAPTER: &str = "d91e80cf2e7be2e162c6513ced06f1dd0da35296";
 const REDEEM_WRAPPER: &str = "a1200000d0002264c9a1698e001292d00e1b00af";
 const WRAPPED_USDC: &str = "3a3bd7bb9528e159577f7c2e685cc81a765002e2";
@@ -289,7 +290,7 @@ pub fn verify_receipt(body: &Value, ctx: &RedemptionContext) -> Check<Redemption
             && l.is(PAYOUT)
             && l.topic_addr(1)? == ctx.funder
             && word(&l.data, 0)? == ctx.condition;
-        let adapted = ((l.emitter == wrapper && l.is(WRAPPER_PAYOUT))
+        let adapted = ((l.emitter == wrapper && (l.is(WRAPPER_PAYOUT) || l.is(LEGACY_WRAPPER_PAYOUT)))
             || (l.emitter == legacy && l.is(LEGACY_PAYOUT)))
             && l.topic_addr(1)? == ctx.funder
             && l.topics.get(2) == Some(&ctx.condition);
@@ -304,7 +305,11 @@ pub fn verify_receipt(body: &Value, ctx: &RedemptionContext) -> Check<Redemption
     let terminal = &logs[end];
     let start = logs[..end]
         .iter()
-        .rposition(|l| l.emitter == terminal.emitter && l.topics.first() == terminal.topics.first())
+        .rposition(|l| l.emitter == terminal.emitter && (
+            l.topics.first() == terminal.topics.first()
+                || (terminal.emitter == wrapper
+                    && (l.is(WRAPPER_PAYOUT) || l.is(LEGACY_WRAPPER_PAYOUT)))
+        ))
         .map(|i| i + 1)
         .unwrap_or(0);
     let segment = &logs[start..=end];
@@ -324,7 +329,9 @@ pub fn verify_receipt(body: &Value, ctx: &RedemptionContext) -> Check<Redemption
         if collateral != crate::merge::USDC && collateral != crate::merge::COLLATERAL_PUSD {
             return Err("unsupported direct collateral".into());
         }
-    } else if redeemer != legacy || collateral != bytes::<20>(WRAPPED_USDC)? {
+    } else if !((redeemer == legacy && collateral == bytes::<20>(WRAPPED_USDC)?)
+        || (terminal.emitter == wrapper && redeemer == wrapper && collateral == crate::merge::USDC))
+    {
         return Err("unsupported adapter redemption".into());
     }
     let mut moves = Vec::new();
@@ -358,14 +365,14 @@ pub fn verify_receipt(body: &Value, ctx: &RedemptionContext) -> Check<Redemption
                 })
         };
         if !direct
-            && (sum(ctx.funder, root)? != units || (root != legacy && sum(root, legacy)? != units))
+            && (sum(ctx.funder, root)? != units || (root != redeemer && sum(root, redeemer)? != units))
         {
             return Err("adapter burn is not covered by wallet transfers".into());
         }
         let allowed = |m: &&Move| {
             m.from == redeemer && m.to == zero
                 || (!direct && m.from == ctx.funder && m.to == root)
-                || (!direct && root != legacy && m.from == root && m.to == legacy)
+                || (!direct && root != redeemer && m.from == root && m.to == redeemer)
         };
         if token_moves.iter().any(|m| !allowed(m)) {
             return Err("ambiguous token movements in redemption".into());
@@ -622,6 +629,54 @@ mod tests {
         // Remove only our payout delivery; another wallet's equal payout is not proof.
         r["logs"].as_array_mut().unwrap().remove(14);
         assert!(verify_receipt(&r, &c).is_err());
+    }
+    #[test]
+    fn wrapper_redeems_standard_collateral_and_delivers_pusd() {
+        let c = ctx();
+        let wrapper = bytes::<20>(REDEEM_WRAPPER).unwrap();
+        let r = receipt(&c, vec![
+            batch(&c, c.funder, wrapper, [6_000_000, 10_000_000], 1),
+            burn(&c, wrapper, 101, 6_000_000, 2),
+            burn(&c, wrapper, 102, 10_000_000, 3),
+            cash(&c, crate::merge::USDC, c.ctf, wrapper, 10_000_000, 4),
+            payout(&c, wrapper, crate::merge::USDC, 10_000_000, 5),
+            cash(&c, crate::merge::COLLATERAL_PUSD, [0; 20], c.funder, 10_000_000, 6),
+            log(&c, wrapper, WRAPPER_PAYOUT, vec![wa(c.funder), c.condition], vec![wu(10_000_000)], 7),
+        ]);
+        assert_eq!(verify_receipt(&r, &c).unwrap().tokens[1].payout_units, 10_000_000);
+        for remove in [0, 2, 4, 5, 6] {
+            let mut bad = r.clone();
+            bad["logs"].as_array_mut().unwrap().remove(remove);
+            assert!(verify_receipt(&bad, &c).is_err(), "missing proof log {remove}");
+        }
+        let mut bad = r.clone();
+        bad["logs"][6]["topics"][2] = json!(format!("0x{}", hex::encode([7; 32])));
+        assert!(verify_receipt(&bad, &c).is_err());
+        let mut bad = r.clone();
+        bad["logs"][5]["topics"][2] = json!(format!("0x{}", hex::encode(wa([8; 20]))));
+        assert!(verify_receipt(&bad, &c).is_err());
+    }
+    #[test]
+    fn mixed_wrapper_event_versions_keep_wallet_segments_separate() {
+        let c = ctx();
+        for (previous, current) in [
+            (WRAPPER_PAYOUT, LEGACY_WRAPPER_PAYOUT),
+            (LEGACY_WRAPPER_PAYOUT, WRAPPER_PAYOUT),
+        ] {
+            let mut other = ctx();
+            other.funder = [8; 20];
+            let mut r = adapter(&other);
+            r["logs"][7]["topics"][0] = json!(format!("0x{previous}"));
+            let mut ours = adapter(&c);
+            ours["logs"][7]["topics"][0] = json!(format!("0x{current}"));
+            for mut l in ours["logs"].as_array().unwrap().clone() {
+                l["logIndex"] = json!(format!("0x{:x}", quantity(&l["logIndex"]).unwrap() + 8));
+                r["logs"].as_array_mut().unwrap().push(l);
+            }
+            assert_eq!(verify_receipt(&r, &c).unwrap().tokens[1].units, 10_000_000);
+            r["logs"].as_array_mut().unwrap().remove(14);
+            assert!(verify_receipt(&r, &c).is_err(), "other wallet cash must not cover ours");
+        }
     }
     #[test]
     fn rejected_receipts_do_not_become_redemption_proof() {
