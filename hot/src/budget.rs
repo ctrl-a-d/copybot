@@ -175,7 +175,8 @@ pub fn effective_ceiling(configured: f64, explicit: f64) -> f64 {
     if explicit.is_finite() && explicit > configured {
         explicit
     } else {
-        configured * COMPOUND_HEADROOM
+        // Derived headroom must remain a valid copy fraction, including at 100%.
+        (configured * COMPOUND_HEADROOM).min(1.0)
     }
 }
 pub fn effective_pct(configured: f64, scale: f64, ceiling: f64, compound: bool) -> f64 {
