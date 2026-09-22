@@ -160,7 +160,7 @@ async fn resolve_pending(
                             sz,
                             px,
                             0.0,
-                            None,
+                            p.his_price,
                             &p.order_hash,
                             p.resting,
                             px_provisional,
@@ -1396,6 +1396,7 @@ async fn submit_tracked(
     headers: &[(&'static str, String)],
     timeout: Duration,
     already_durable: bool,
+    his_price: Option<f64>,
 ) -> Result<
     (copybot_hot::race_send::Outcome, Vec<copybot_hot::race_send::PathResult>),
     String,
@@ -1409,6 +1410,7 @@ async fn submit_tracked(
         order_hash,
         shares: prov.shares,
         limit: prov.limit,
+        his_price,
         ts: copybot_hot::ledger::now_secs(),
         why: prov.why(),
         resting,
@@ -1612,6 +1614,7 @@ async fn rescue_exit(
                 &hdrs,
                 std::time::Duration::from_secs(10),
                 false,
+                None,
             )
             .await else {
             emitter
@@ -4760,6 +4763,7 @@ derived but are NOT accepted; every order would be refused. Refusing to continue
                                 &hdrs,
                                 Duration::from_secs(10),
                                 false,
+                                None,
                             )
                             .await
                         {
@@ -5042,6 +5046,7 @@ SOLD — the wallet still holds everything it held before.",
                             &hdrs,
                             Duration::from_secs(10),
                             false,
+                            None,
                         )
                         .await
                     {
@@ -5634,6 +5639,7 @@ naked exposure and is flattened regardless of the merge outcome"
                                     &hdrs,
                                     Duration::from_secs(10),
                                     false,
+                                    None,
                                 )
                                 .await
                             {
@@ -5942,6 +5948,7 @@ naked exposure and is flattened regardless of the merge outcome"
                             &hdr_vec,
                             Duration::from_secs(10),
                             false,
+                            None,
                         )
                         .await
                     {
@@ -7820,6 +7827,7 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
                                     order_hash: hex::encode(ord.digest()),
                                     shares: intent.shares,
                                     limit,
+                                    his_price: Some(d.price),
                                     ts: copybot_hot::ledger::now_secs(),
                                     why: "submitting".into(),
                                     resting: order_type == "GTC",
@@ -7948,6 +7956,7 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
                                         &hdrs,
                                         Duration::from_secs(10),
                                         buy_wal_row.is_some(),
+                                        Some(his_price_for_resp),
                                     )
                                     .await
                                 {
@@ -8069,6 +8078,7 @@ not release {unfilled} unfilled shares: {e:?} — this order stays under-copied"
                                                 order_hash: hash_c.clone(),
                                                 shares: shares_for_resp,
                                                 limit: limit_for_resp,
+                                                his_price: Some(his_price_for_resp),
                                                 ts: copybot_hot::ledger::now_secs(),
                                                 why: "duplicate_only".into(),
                                                 resting: otype_c == "GTC",
@@ -8169,6 +8179,7 @@ not release {unfilled} unfilled shares: {e:?} — this order stays under-copied"
                                                 order_hash: hash_c.clone(),
                                                 shares: shares_for_resp,
                                                 limit: limit_for_resp,
+                                                his_price: Some(his_price_for_resp),
                                                 ts: copybot_hot::ledger::now_secs(),
                                                 why: format!("ambiguous:{detail}"),
                                                 resting: otype_c == "GTC",
@@ -8198,6 +8209,7 @@ not release {unfilled} unfilled shares: {e:?} — this order stays under-copied"
                                                 order_hash: hash_c.clone(),
                                                 shares: shares_for_resp,
                                                 limit: limit_for_resp,
+                                                his_price: Some(his_price_for_resp),
                                                 ts: copybot_hot::ledger::now_secs(),
                                                 why: "no_response".into(),
                                                 resting: otype_c == "GTC",
@@ -8247,6 +8259,88 @@ not release {unfilled} unfilled shares: {e:?} — this order stays under-copied"
                     }
                 }
             }
+        }
+    }
+}
+#[cfg(test)]
+mod pending_price_tests {
+    use super::*;
+    use copybot_hot::pending::{Pending, PendingLog};
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn recovered_fill_preserves_leader_price_in_ledger_and_positions() {
+        for his_price in [Some(0.3299), None] {
+            let dir = std::env::temp_dir().join(format!(
+                "copybot-pending-price-{}-{}", std::process::id(), now_ms()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let pending_path = dir.join("pending.jsonl");
+            let ledger_path = dir.join("ledger.jsonl");
+            let cfgs = [("test-lane".into(), copybot_hot::risk::RiskConfig::default())];
+            let mut log = PendingLog::open(pending_path.to_str().unwrap());
+            log.record(Pending {
+                lane: "test-lane".into(), token: "test-token".into(), side: 0,
+                order_hash: "abc".into(), shares: 18.0, limit: 0.34, his_price,
+                ts: copybot_hot::ledger::now_secs() - 10,
+                why: "submitting".into(), resting: false,
+            }).unwrap();
+            // Recover from disk, as after a delayed response followed by a restart.
+            let log = Arc::new(Mutex::new(PendingLog::open(pending_path.to_str().unwrap())));
+            let control = Arc::new(Mutex::new(Control::new(
+                Ledger::new(ledger_path.to_str().unwrap(), &cfgs), ""
+            )));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let clob = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let mut buf = [0; 1024];
+                    let n = stream.read(&mut buf).await.unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&buf[..n]);
+                }
+                assert!(request.starts_with(b"GET /data/order/0xabc "));
+                let body = r#"{"status":"matched","size_matched":"18","takingAmount":"18","makingAmount":"5.94"}"#;
+                stream.write_all(format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                ).as_bytes()).await.unwrap();
+            });
+            let creds = Arc::new(Some(copybot_hot::auth::ApiCreds {
+                key: "test-key".into(), secret: "dGVzdA==".into(),
+                passphrase: "test-passphrase".into(),
+            }));
+            let emitter = Arc::new(Emitter::new(
+                dir.join("events.jsonl").to_string_lossy().into_owned(), false
+            ));
+            let router = Arc::new(Router::new(vec![]));
+            resolve_pending(&log, &control, &router, &emitter, &clob, &creds,
+                "test-signer", 0, None).await;
+            server.await.unwrap();
+            assert_eq!(log.lock().unwrap().len(), 0);
+            // A second resolver pass must not duplicate the fill.
+            resolve_pending(&log, &control, &router, &emitter, &clob, &creds,
+                "test-signer", 0, None).await;
+            let ledger = Ledger::new(ledger_path.to_str().unwrap(), &cfgs);
+            let positions = ledger.open_positions("test-lane");
+            assert_eq!(positions.len(), 1);
+            assert_eq!(positions[0].1, 18.0);
+            assert!((positions[0].2 - 0.33).abs() < 1e-12);
+            match his_price {
+                Some(hp) => assert!((positions[0].4.unwrap() - hp).abs() < 1e-12),
+                None => assert_eq!(positions[0].4, None),
+            }
+            assert_eq!(positions[0].5, if his_price.is_some() { 18.0 } else { 0.0 });
+            let rows: Vec<serde_json::Value> = std::fs::read_to_string(&ledger_path)
+                .unwrap().lines().map(|s| serde_json::from_str(s).unwrap()).collect();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["his_price"].as_f64(), his_price);
+            assert!((ledger.open_usd("test-lane") - 5.94).abs() < 1e-12);
+            drop(emitter);
+            std::fs::remove_dir_all(dir).unwrap();
         }
     }
 }

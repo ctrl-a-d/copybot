@@ -238,6 +238,7 @@ mod tests {
                 order_hash: hash.into(),
                 shares: 41.0,
                 limit: 0.53,
+                his_price: None,
                 ts: 1_000,
                 why: "submitting".into(),
                 resting: false,

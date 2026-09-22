@@ -16,6 +16,7 @@ pub struct Pending {
     pub order_hash: String,
     pub shares: f64,
     pub limit: f64,
+    pub his_price: Option<f64>,
     pub ts: i64,
     pub why: String,
     pub resting: bool,
@@ -277,6 +278,7 @@ impl PendingLog {
                                 order_hash: hash.to_string(),
                                 shares: v["shares"].as_f64().unwrap_or(0.0),
                                 limit: v["limit"].as_f64().unwrap_or(0.0),
+                                his_price: v["his_price"].as_f64(),
                                 ts: v["t"].as_i64().unwrap_or(0),
                                 why: v["why"].as_str().unwrap_or("").to_string(),
                                 resting: v["resting"].as_bool().unwrap_or(false),
@@ -321,7 +323,7 @@ impl PendingLog {
             let row = serde_json::json!(
                 { "ev" : "pending", "lane" : p.lane, "token" : p.token, "side" : p.side,
                 "order_hash" : p.order_hash, "shares" : p.shares, "limit" : p.limit,
-                "why" : p.why, "t" : p.ts, "resting" : p.resting }
+                "why" : p.why, "t" : p.ts, "resting" : p.resting, "his_price" : p.his_price }
             );
             writeln!(out, "{row}").map_err(|e| format!("write {tmp}: {e}"))?;
         }
@@ -339,7 +341,7 @@ impl PendingLog {
         let row = serde_json::json!(
             { "ev" : "pending", "lane" : p.lane, "token" : p.token, "side" : p.side,
             "order_hash" : p.order_hash, "shares" : p.shares, "limit" : p.limit, "why" :
-            p.why, "t" : p.ts, "resting" : p.resting }
+            p.why, "t" : p.ts, "resting" : p.resting, "his_price" : p.his_price }
         );
         let mut b = row.to_string().into_bytes();
         b.push(b'\n');
@@ -374,7 +376,7 @@ impl PendingLog {
         let row = serde_json::json!(
             { "ev" : "pending", "lane" : p.lane, "token" : p.token, "side" : p.side,
             "order_hash" : p.order_hash, "shares" : p.shares, "limit" : p.limit, "why" :
-            p.why, "t" : p.ts, "resting" : p.resting }
+            p.why, "t" : p.ts, "resting" : p.resting, "his_price" : p.his_price }
         );
         if !self.append(&row) {
             let e = format!("cannot persist pending order {}", p.order_hash);
@@ -788,6 +790,48 @@ mod tests {
         )
             .to_string()
     }
+    #[test]
+    fn leader_price_survives_pending_journal_wal_and_compaction() {
+        let path = tmp2("leader_price");
+        let wal = tmp2("leader_price_wal");
+        for side in [0, 1] {
+            let mut order = p("leader-price-order", 100);
+            order.side = side;
+            order.his_price = Some(0.3299);
+            let mut log = PendingLog::open(&path);
+            log.record(order.clone()).unwrap();
+            assert_eq!(PendingLog::open(&path).due(200), vec![order.clone()]);
+            log.compact().unwrap();
+            assert_eq!(PendingLog::open(&path).due(200), vec![order.clone()]);
+
+            std::fs::remove_file(&path).unwrap();
+            std::fs::write(&wal, PendingLog::row_bytes(&order)).unwrap();
+            let (recovered, rows) = PendingLog::open_with_wal(&path, Some(&wal));
+            assert_eq!(rows, 1);
+            assert_eq!(recovered.due(200), vec![order.clone()]);
+            recovered.absorb_wal(rows).unwrap();
+            assert_eq!(PendingLog::open(&path).due(200), vec![order]);
+            std::fs::remove_file(&path).unwrap();
+        }
+        std::fs::remove_file(&wal).unwrap();
+    }
+    #[test]
+    fn legacy_and_unknown_leader_prices_remain_unknown() {
+        let path = tmp2("unknown_leader_price");
+        for value in [None, Some(serde_json::Value::Null)] {
+            let mut row: serde_json::Value =
+                serde_json::from_str(&row_pending("legacy-order", 100)).unwrap();
+            if let Some(value) = value {
+                row["his_price"] = value;
+            }
+            std::fs::write(&path, row.to_string()).unwrap();
+            let log = PendingLog::open(&path);
+            assert_eq!(log.due(200)[0].his_price, None);
+            log.compact().unwrap();
+            assert_eq!(PendingLog::open(&path).due(200)[0].his_price, None);
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
     fn row_resolved(hash: &str, ts: i64) -> String {
         serde_json::json!(
             { "ev" : "resolved", "order_hash" : hash, "verdict" : "matched",
@@ -907,6 +951,7 @@ mod tests {
             order_hash: "0xabc".into(),
             shares: 5.0,
             limit: 0.5,
+            his_price: None,
             ts: 1,
             why: "submitting".into(),
             resting: true,
@@ -979,6 +1024,7 @@ mod tests {
             order_hash: "deadbeef".into(),
             shares: 1.0,
             limit: 0.5,
+            his_price: None,
             ts: 1,
             why: "submitting".into(),
             resting: false,
@@ -1005,6 +1051,7 @@ mod tests {
                 order_hash: "abc".into(),
                 shares: 2.0,
                 limit: 0.4,
+                his_price: None,
                 ts: 1,
                 why: "submitting".into(),
                 resting: false,
@@ -1033,6 +1080,7 @@ mod tests {
                 order_hash: "deadbeef".into(),
                 shares: 5.0,
                 limit: 0.4,
+                his_price: None,
                 ts: 1,
                 why: "submitting".into(),
                 resting: false,
@@ -1115,6 +1163,7 @@ mod tests {
             order_hash: "same".into(),
             shares: 2.0,
             limit: 0.4,
+            his_price: None,
             ts: 1,
             why: why.into(),
             resting: false,
@@ -1247,6 +1296,7 @@ mod tests {
             order_hash: hash.into(),
             shares: 10.0,
             limit: 0.5,
+            his_price: None,
             ts,
             why: "duplicate_only".into(),
             resting: false,

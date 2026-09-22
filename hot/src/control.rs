@@ -490,6 +490,7 @@ mod tests {
                 order_hash: "h".into(),
                 shares: 100.0,
                 limit: 0.9,
+                his_price: None,
                 ts: 1,
                 why: "x".into(),
                 resting: false,
